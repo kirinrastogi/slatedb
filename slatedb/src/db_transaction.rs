@@ -1680,6 +1680,7 @@ mod tests {
             object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             default_ttl: None,
+            metric_level: slatedb_common::metrics::MetricLevel::default(),
             block_format: None,
         }
     }

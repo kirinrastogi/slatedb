@@ -323,6 +323,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_set_json_updates_metric_level() {
+        let settings = Arc::new(Settings::new(slatedb::Settings::default()));
+        assert_eq!(
+            settings.inner().metric_level,
+            slatedb::MetricLevel::Info,
+            "default should be Info"
+        );
+
+        settings
+            .set("metric_level".to_owned(), "\"Debug\"".to_owned())
+            .unwrap();
+
+        assert_eq!(settings.inner().metric_level, slatedb::MetricLevel::Debug);
+    }
+
+    #[test]
     fn settings_from_file_reads_config() {
         figment::Jail::expect_with(|jail| {
             jail.create_file(

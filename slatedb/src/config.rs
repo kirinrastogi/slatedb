@@ -183,6 +183,7 @@ use figment::providers::{Env, Format, Json, Toml, Yaml};
 use figment::{Figment, Metadata, Provider};
 use log::warn;
 use serde::{Deserialize, Serialize, Serializer};
+use slatedb_common::metrics::MetricLevel;
 use std::collections::HashMap;
 use std::path::Path;
 use std::{str::FromStr, time::Duration};
@@ -662,6 +663,13 @@ pub struct Settings {
     /// Default: no TTL (insertions will remain until deleted)
     pub default_ttl: Option<u64>,
 
+    /// Controls which metrics are active. Metrics with a level below the configured
+    /// threshold are replaced with zero-cost no-op handles at registration time.
+    ///
+    /// - `Info` (default): Only standard operational metrics are active.
+    /// - `Debug`: All metrics are active, including high-frequency hot-path metrics.
+    pub metric_level: MetricLevel,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -694,7 +702,8 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("filter_bits_per_key", &self.filter_bits_per_key)
-            .field("default_ttl", &self.default_ttl);
+            .field("default_ttl", &self.default_ttl)
+            .field("metric_level", &self.metric_level);
         data.finish()
     }
 }
@@ -889,6 +898,7 @@ impl Default for Settings {
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
             filter_bits_per_key: 10,
             default_ttl: None,
+            metric_level: MetricLevel::default(),
             #[cfg(test)]
             block_format: None,
         }
@@ -1316,6 +1326,54 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn test_metric_level_defaults_to_info() {
+        let settings = Settings::default();
+        assert_eq!(settings.metric_level, MetricLevel::Info);
+    }
+
+    #[test]
+    fn test_metric_level_json_roundtrip() {
+        let mut settings = Settings::default();
+        settings.metric_level = MetricLevel::Debug;
+
+        let json = settings.to_json_string().expect("failed to serialize");
+        let loaded: Settings = serde_json::from_str(&json).expect("failed to deserialize");
+        assert_eq!(loaded.metric_level, MetricLevel::Debug);
+    }
+
+    #[test]
+    fn test_metric_level_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("SLATEDB_METRIC_LEVEL", "Debug");
+
+            let options =
+                Settings::from_env("SLATEDB_").expect("failed to load settings from env");
+            assert_eq!(options.metric_level, MetricLevel::Debug);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_metric_level_from_toml_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+metric_level = "Debug"
+"#,
+            )
+            .expect("failed to create config file");
+
+            let options =
+                Settings::from_file("config.toml").expect("failed to load settings from file");
+            assert_eq!(options.metric_level, MetricLevel::Debug);
+
+            Ok(())
+        });
+    }
 
     #[test]
     fn test_db_options_load_from_env() {

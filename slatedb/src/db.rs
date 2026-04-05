@@ -1738,8 +1738,8 @@ mod tests {
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::clock::MockSystemClock;
     use slatedb_common::metrics::{
-        lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder, MetricValue,
-        MetricsRecorderHelper,
+        lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel,
+        MetricValue, MetricsRecorderHelper,
     };
     use std::collections::BTreeMap;
     use std::collections::Bound::Included;
@@ -5533,6 +5533,7 @@ mod tests {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             default_ttl: ttl,
+            metric_level: MetricLevel::default(),
             block_format: None,
         }
     }

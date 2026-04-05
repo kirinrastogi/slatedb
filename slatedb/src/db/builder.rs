@@ -366,7 +366,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             .system_clock
             .unwrap_or_else(|| Arc::new(DefaultSystemClock::new()));
 
-        let recorder = MetricsRecorderHelper::new(self.metrics_recorder, MetricLevel::default());
+        let recorder = MetricsRecorderHelper::new(self.metrics_recorder, self.settings.metric_level);
         let retrying_main_object_store = instrumented_retrying_object_store(
             self.main_object_store,
             &recorder,
@@ -728,6 +728,7 @@ pub struct GarbageCollectorBuilder<P: Into<Path>> {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     options: GarbageCollectorOptions,
     recorder: MetricsRecorderHelper,
+    metric_level: MetricLevel,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
 }
@@ -740,6 +741,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             wal_object_store: None,
             options: GarbageCollectorOptions::default(),
             recorder: MetricsRecorderHelper::noop(),
+            metric_level: MetricLevel::default(),
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
         }
@@ -753,6 +755,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             wal_object_store: self.wal_object_store,
             options: self.options,
             recorder: self.recorder,
+            metric_level: self.metric_level,
             system_clock: self.system_clock,
             rand: self.rand,
         }
@@ -764,9 +767,15 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
         self
     }
 
+    /// Sets the metric level to use for the garbage collector.
+    pub fn with_metric_level(mut self, level: MetricLevel) -> Self {
+        self.metric_level = level;
+        self
+    }
+
     /// Sets a user-provided metrics recorder for the garbage collector.
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
-        self.recorder = MetricsRecorderHelper::new(recorder, MetricLevel::default());
+        self.recorder = MetricsRecorderHelper::new(recorder, self.metric_level);
         self
     }
 
@@ -871,6 +880,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
     rand: Arc<DbRand>,
     recorder: MetricsRecorderHelper,
+    metric_level: MetricLevel,
     system_clock: Arc<dyn SystemClock>,
     closed_result: ClosedResultWriter,
     merge_operator: Option<MergeOperatorType>,
@@ -890,6 +900,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             scheduler_supplier: None,
             rand: Arc::new(DbRand::default()),
             recorder: MetricsRecorderHelper::noop(),
+            metric_level: MetricLevel::default(),
             system_clock: Arc::new(DefaultSystemClock::default()),
             closed_result: ClosedResultWriter::new(WatchableOnceCell::new()),
             merge_operator: None,
@@ -908,6 +919,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             scheduler_supplier: self.scheduler_supplier,
             rand: self.rand,
             recorder: self.recorder,
+            metric_level: self.metric_level,
             system_clock: self.system_clock,
             closed_result: self.closed_result,
             merge_operator: self.merge_operator,
@@ -930,9 +942,15 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
+    /// Sets the metric level to use for the compactor.
+    pub fn with_metric_level(mut self, level: MetricLevel) -> Self {
+        self.metric_level = level;
+        self
+    }
+
     /// Sets a user-provided metrics recorder for the compactor.
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
-        self.recorder = MetricsRecorderHelper::new(recorder, MetricLevel::default());
+        self.recorder = MetricsRecorderHelper::new(recorder, self.metric_level);
         self
     }
 
@@ -1171,6 +1189,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     recorder: MetricsRecorderHelper,
+    metric_level: MetricLevel,
 }
 
 impl<P: Into<Path>> DbReaderBuilder<P> {
@@ -1188,6 +1207,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
             recorder: MetricsRecorderHelper::noop(),
+            metric_level: MetricLevel::default(),
         }
     }
 
@@ -1248,9 +1268,15 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         self
     }
 
+    /// Sets the metric level to use for the reader.
+    pub fn with_metric_level(mut self, level: MetricLevel) -> Self {
+        self.metric_level = level;
+        self
+    }
+
     /// Sets the metrics recorder to use for the reader.
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
-        self.recorder = MetricsRecorderHelper::new(recorder, MetricLevel::default());
+        self.recorder = MetricsRecorderHelper::new(recorder, self.metric_level);
         self
     }
 
@@ -1552,5 +1578,64 @@ mod tests {
         );
 
         db.close().await.expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn test_db_builder_uses_metric_level_from_settings() {
+        use slatedb_common::metrics::MetricLevel;
+
+        // With default Info level, a known Info-level metric should be registered
+        let recorder_info = Arc::new(DefaultMetricsRecorder::new());
+        let db_info = crate::Db::builder(
+            "test_metric_level_info",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(Settings {
+            metric_level: MetricLevel::Info,
+            ..Settings::default()
+        })
+        .with_metrics_recorder(recorder_info.clone())
+        .build()
+        .await
+        .expect("failed to build db");
+
+        // With Debug level, the same metric should also be registered
+        let recorder_debug = Arc::new(DefaultMetricsRecorder::new());
+        let db_debug = crate::Db::builder(
+            "test_metric_level_debug",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(Settings {
+            metric_level: MetricLevel::Debug,
+            ..Settings::default()
+        })
+        .with_metrics_recorder(recorder_debug.clone())
+        .build()
+        .await
+        .expect("failed to build db");
+
+        // Both should have registered the object store request count metric
+        // (it's Info level by default, so both levels should include it)
+        let snap_info = recorder_info.snapshot();
+        let snap_debug = recorder_debug.snapshot();
+        assert!(
+            !snap_info.all().is_empty(),
+            "Info-level recorder should have registered metrics"
+        );
+        assert!(
+            !snap_debug.all().is_empty(),
+            "Debug-level recorder should have registered metrics"
+        );
+
+        // Debug level should register at least as many metrics as Info level
+        assert!(
+            snap_debug.all().len() >= snap_info.all().len(),
+            "Debug level should register >= Info level metrics (debug={}, info={})",
+            snap_debug.all().len(),
+            snap_info.all().len(),
+        );
+
+        db_info.close().await.expect("failed to close db");
+        db_debug.close().await.expect("failed to close db");
     }
 }
