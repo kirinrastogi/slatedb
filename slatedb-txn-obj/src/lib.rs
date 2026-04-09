@@ -402,6 +402,27 @@ impl<T: Clone + Send + Sync> FenceableTransactionalObject<T, MonotonicId> {
         }
         Ok(())
     }
+
+    /// Advances the local state to a known-good version written by
+    /// another fenced writer (e.g. the compactor advancing the writer's
+    /// view). No storage IO.
+    ///
+    /// Returns `Ok(true)` if advanced, `Ok(false)` if the incoming
+    /// version is not newer (no-op). Returns `Err(Fenced)` if the
+    /// incoming object has a different epoch than ours.
+    pub fn advance_to(
+        &mut self,
+        dirty: &DirtyObject<T, MonotonicId>,
+    ) -> Result<bool, TransactionalObjectError>
+    where
+        T: Clone,
+    {
+        if !self.delegate.advance_to(dirty) {
+            return Ok(false);
+        }
+        self.check_epoch()?;
+        Ok(true)
+    }
 }
 
 #[async_trait::async_trait]
@@ -490,6 +511,25 @@ impl<T: Clone, Id: Copy> SimpleTransactionalObject<T, Id> {
         Self::try_load(store)
             .await?
             .ok_or_else(|| TransactionalObjectError::LatestRecordMissing)
+    }
+
+    /// Advances the local state to a known-good version without reading
+    /// from storage. Used when the caller already holds the just-written
+    /// object (e.g. passed in-process from another writer).
+    ///
+    /// Returns `true` if the state was advanced, `false` if `dirty.id`
+    /// is not newer than the current id (stale/duplicate — no-op).
+    pub(crate) fn advance_to(&mut self, dirty: &DirtyObject<T, Id>) -> bool
+    where
+        Id: Ord,
+        T: Clone,
+    {
+        if dirty.id <= self.id {
+            return false;
+        }
+        self.id = dirty.id;
+        self.object = dirty.value.clone();
+        true
     }
 }
 

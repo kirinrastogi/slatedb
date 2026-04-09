@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, info};
+use slatedb_txn_obj::DirtyObject;
 
 use crate::compactions_store::{CompactionsStore, FenceableCompactions, StoredCompactions};
 use crate::compactor::CompactionsCore;
@@ -303,6 +304,12 @@ impl CompactorStateWriter {
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    /// Returns a `DirtyObject<Manifest>` from the fenceable manifest,
+    /// which has the correct version id after a successful write.
+    pub(crate) fn manifest_dirty(&self) -> Result<DirtyObject<Manifest>, SlateDBError> {
+        self.manifest.prepare_dirty()
     }
 
     /// Writes manifest first, then compactions, retrying manifest conflicts.

@@ -23,9 +23,11 @@ use crate::db_state::SsTableView;
 use crate::dispatcher::MessageHandler;
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
+use crate::manifest::Manifest;
 use crate::oracle::Oracle;
 use crate::utils::IdGenerator;
 use crate::utils::SafeSender;
+use slatedb_txn_obj::DirtyObject;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -60,6 +62,9 @@ enum ManifestWriterCommand {
     },
     /// Periodic manifest poll to pick up remote changes (e.g. compaction).
     PollManifest,
+    /// Advance manifest to a version provided by an in-process compactor.
+    /// Skips the object store read that `PollManifest` would do.
+    AdvanceManifest(Box<DirtyObject<Manifest>>),
 }
 
 impl std::fmt::Debug for ManifestWriterCommand {
@@ -79,6 +84,7 @@ impl std::fmt::Debug for ManifestWriterCommand {
                 write!(f, "CreateCheckpoint({through_seq:?})")
             }
             Self::PollManifest => write!(f, "PollManifest"),
+            Self::AdvanceManifest(dirty) => write!(f, "AdvanceManifest(id={:?})", dirty.id),
         }
     }
 }
@@ -153,6 +159,16 @@ impl ManifestWriter {
             })
     }
 
+    /// Advances the manifest to a version provided by an in-process
+    /// compactor. Skips the object store read that `PollManifest` does.
+    pub(crate) fn advance_manifest(
+        &self,
+        dirty: DirtyObject<Manifest>,
+    ) -> Result<(), SlateDBError> {
+        self.commands_tx
+            .send(ManifestWriterCommand::AdvanceManifest(Box::new(dirty)))
+    }
+
     pub(crate) async fn shutdown(executor: &crate::dispatcher::MessageHandlerExecutor) {
         if let Err(e) = executor.shutdown_task(MANIFEST_WRITER_TASK_NAME).await {
             log::warn!("failed to shutdown l0 manifest writer [error={:?}]", e);
@@ -210,6 +226,9 @@ impl MessageHandler<ManifestWriterCommand> for ManifestWriterHandler {
                     .await
             }
             ManifestWriterCommand::PollManifest => self.refresh_manifest_progress().await,
+            ManifestWriterCommand::AdvanceManifest(dirty) => {
+                self.advance_manifest_progress(*dirty)
+            }
         }
     }
 
@@ -545,6 +564,22 @@ impl ManifestWriterHandler {
         let remote_dirty = self.manifest.prepare_dirty()?;
         self.merge_remote_manifest(remote_dirty);
         let _ = self.tracker_tx.send(TrackerMessage::ManifestRefreshed);
+        Ok(())
+    }
+
+    /// Advances the local manifest to the version provided by an in-process
+    /// compactor without reading from object storage.
+    fn advance_manifest_progress(
+        &mut self,
+        dirty: DirtyObject<Manifest>,
+    ) -> Result<(), SlateDBError> {
+        if self.manifest.advance_to(&dirty)? {
+            self.merge_remote_manifest(dirty);
+            let _ = self.tracker_tx.send(TrackerMessage::ManifestRefreshed);
+        }
+        // If advance_to returned false, our manifest is already at or past
+        // the incoming version (e.g. a PollManifest tick or L0 write raced
+        // ahead). Nothing to do.
         Ok(())
     }
 

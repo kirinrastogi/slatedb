@@ -19,7 +19,9 @@ use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
+use crate::manifest::Manifest;
 use crate::memtable_flusher::manifest_writer::ManifestWriter;
+use slatedb_txn_obj::DirtyObject;
 use crate::memtable_flusher::tracker::FlushTracker;
 use crate::memtable_flusher::uploader::Uploader;
 use crate::utils::SafeSender;
@@ -111,6 +113,18 @@ impl MemtableFlusher {
     pub(crate) fn notify_memtable_frozen(&self) -> Result<(), SlateDBError> {
         self.messages_tx
             .send(tracker::TrackerMessage::MemtableFrozen)
+    }
+
+    /// Notifies the flusher that the remote manifest has changed (e.g. an
+    /// embedded compactor just wrote a new manifest). Carries the just-written
+    /// manifest so the manifest_writer can advance its local state without
+    /// an object store read.
+    pub(crate) fn notify_manifest_changed(
+        &self,
+        dirty: DirtyObject<Manifest>,
+    ) -> Result<(), SlateDBError> {
+        self.messages_tx
+            .send(tracker::TrackerMessage::NotifyManifestChanged(dirty))
     }
 
     /// Creates a checkpoint using the memtable flusher's flush semantics.

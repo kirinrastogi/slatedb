@@ -21,9 +21,11 @@ use crate::config::CheckpointOptions;
 use crate::db::DbInner;
 use crate::dispatcher::MessageHandler;
 use crate::error::SlateDBError;
+use crate::manifest::Manifest;
 use crate::memtable_flusher::manifest_writer::{FlushResult, ManifestWriter};
 use crate::memtable_flusher::uploader::{UploadJob, UploadedMemtable, Uploader};
 use crate::memtable_flusher::FlushTarget;
+use slatedb_txn_obj::DirtyObject;
 use crate::oracle::Oracle;
 use crate::utils::IdGenerator;
 use fail_parallel::fail_point;
@@ -52,6 +54,9 @@ pub(crate) enum TrackerMessage {
     FlushComplete { through_seq: u64 },
     /// Remote manifest changes were merged into local state.
     ManifestRefreshed,
+    /// An in-process compactor wrote a new manifest. Carries the just-written
+    /// state so the manifest_writer can advance without an object store read.
+    NotifyManifestChanged(DirtyObject<Manifest>),
 }
 
 impl std::fmt::Debug for TrackerMessage {
@@ -71,6 +76,9 @@ impl std::fmt::Debug for TrackerMessage {
                 write!(f, "FlushComplete(through_seq={through_seq})")
             }
             Self::ManifestRefreshed => write!(f, "ManifestRefreshed"),
+            Self::NotifyManifestChanged(dirty) => {
+                write!(f, "NotifyManifestChanged(id={:?})", dirty.id)
+            }
         }
     }
 }
@@ -119,6 +127,9 @@ impl MessageHandler<TrackerMessage> for FlushTracker {
                 self.reconcile_and_dispatch().await
             }
             TrackerMessage::ManifestRefreshed => self.reconcile_and_dispatch().await,
+            TrackerMessage::NotifyManifestChanged(dirty) => {
+                self.manifest_writer.advance_manifest(dirty)
+            }
         }
     }
 

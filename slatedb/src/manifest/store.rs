@@ -88,6 +88,16 @@ impl FenceableManifest {
         Ok(self.inner.update(dirty).await?)
     }
 
+    /// Advances the local manifest to a version written by another fenced
+    /// writer (e.g. the compactor). No storage IO.
+    /// Returns `Ok(true)` if advanced, `Ok(false)` if stale.
+    pub(crate) fn advance_to(
+        &mut self,
+        dirty: &DirtyObject<Manifest>,
+    ) -> Result<bool, SlateDBError> {
+        Ok(self.inner.advance_to(dirty)?)
+    }
+
     pub(crate) fn new_checkpoint(
         &self,
         checkpoint_id: Uuid,
