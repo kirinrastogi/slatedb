@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::compactor::stats::CompactionStats;
 use crate::error::SlateDBError;
 use crate::iter::{RowEntryIterator, TrackedRowEntryIterator};
 use crate::seq_tracker::{FindOption, SequenceTracker};
@@ -36,6 +37,8 @@ pub(crate) struct RetentionIterator<T: RowEntryIterator> {
     system_clock: Arc<dyn SystemClock>,
     /// Historical sequence metadata used to translate sequence numbers into wall-clock timestamps.
     sequence_tracker: Arc<SequenceTracker>,
+    /// Optional compaction metrics to record retention events. None when used by flush.
+    stats: Option<Arc<CompactionStats>>,
 }
 
 impl<T: RowEntryIterator> RetentionIterator<T> {
@@ -48,6 +51,7 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
         compaction_start_ts: i64,
         system_clock: Arc<dyn SystemClock>,
         sequence_tracker: Arc<SequenceTracker>,
+        stats: Option<Arc<CompactionStats>>,
     ) -> Result<Self, SlateDBError> {
         Ok(Self {
             inner,
@@ -57,6 +61,7 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
             compaction_start_ts,
             system_clock,
             sequence_tracker,
+            stats,
             buffer: RetentionBuffer::new(),
         })
     }
@@ -75,10 +80,15 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
         retention_min_seq: Option<u64>,
         filter_tombstone: bool,
         sequence_tracker: Arc<SequenceTracker>,
+        stats: Option<&Arc<CompactionStats>>,
     ) -> BTreeMap<Reverse<u64>, RowEntry> {
         let mut filtered_versions = BTreeMap::new();
         let current_system_ts = system_clock.now().timestamp_millis();
-        for (_, entry) in versions.into_iter() {
+        let input_count = versions.len();
+        let mut versions_iter = versions.into_iter();
+        let mut consumed = 0usize;
+        while let Some((_, entry)) = versions_iter.next() {
+            consumed += 1;
             // filter out any expired entries -- eventually we can consider
             // abstracting this away into generic, pluggable compaction filters
             // but for now we do it inline
@@ -88,7 +98,13 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
                     if is_merge {
                         // just skip expired merge entries rather than write a tombstone
                         // as earlier merges may still be un-expired
+                        if let Some(s) = stats {
+                            s.expired_merges_dropped.increment(1);
+                        }
                         continue;
+                    }
+                    if let Some(s) = stats {
+                        s.tombstones_created.increment(1);
                     }
                     // for values, insert a tombstone instead of just filtering out the
                     // value in the iterator because this may otherwise "revive"
@@ -161,6 +177,14 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
             }
         }
 
+        // Any versions the loop did not consume are older records dropped by the retention break.
+        let dropped_by_retention = input_count.saturating_sub(consumed);
+        if let Some(s) = stats {
+            if dropped_by_retention > 0 {
+                s.records_dropped.increment(dropped_by_retention as u64);
+            }
+        }
+
         if filter_tombstone {
             // remove the tombstones in the tail
             while filtered_versions
@@ -170,6 +194,9 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
                 .unwrap_or(false)
             {
                 filtered_versions.pop_last();
+                if let Some(s) = stats {
+                    s.tombstones_dropped.increment(1);
+                }
             }
         }
 
@@ -226,6 +253,7 @@ impl<T: RowEntryIterator> RowEntryIterator for RetentionIterator<T> {
                     let retention_timeout = self.retention_timeout;
                     let retention_min_seq = self.retention_min_seq;
                     let system_clock = self.system_clock.clone();
+                    let stats = self.stats.clone();
                     self.buffer.process_retention(|versions| {
                         Self::apply_retention_filter(
                             versions,
@@ -235,6 +263,7 @@ impl<T: RowEntryIterator> RowEntryIterator for RetentionIterator<T> {
                             retention_min_seq,
                             self.filter_tombstone,
                             self.sequence_tracker.clone(),
+                            stats.as_ref(),
                         )
                     })?;
                 }
@@ -1012,6 +1041,7 @@ mod tests {
             test_case.retention_min_seq,
             test_case.filter_tombstone,
             Arc::new(SequenceTracker::new()),
+            None,
         );
 
         // Convert filtered versions back to expected order
@@ -1124,6 +1154,7 @@ mod tests {
             None,
             false,
             tracker,
+            None,
         );
 
         let derived_ts = sorted_points

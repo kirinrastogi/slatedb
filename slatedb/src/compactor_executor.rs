@@ -328,6 +328,7 @@ impl TokioCompactionExecutorInner {
             job_args.compaction_clock_tick,
             self.clock.clone(),
             Arc::new(stored_manifest.db_state().sequence_tracker.clone()),
+            Some(self.stats.clone()),
         )
         .await?;
         retention_iter.init().await?;
@@ -394,6 +395,7 @@ impl TokioCompactionExecutorInner {
         args: StartCompactionJobArgs,
     ) -> Result<SortedRun, SlateDBError> {
         debug!("executing compaction [job_args={:?}]", args);
+        let job_start = self.clock.now();
         let mut all_iter = self.load_iterators(&args).await?;
         let mut output_ssts = args.output_ssts.clone();
         let mut current_writer = self.table_store.table_writer(SsTableId::Compacted(
@@ -418,6 +420,7 @@ impl TokioCompactionExecutorInner {
             if let Some(block_size) = current_writer.add(kv).await? {
                 bytes_written += block_size;
             }
+            self.stats.entries_written.increment(1);
 
             if bytes_written > self.options.max_sst_size {
                 let finished_writer = mem::replace(
@@ -429,6 +432,7 @@ impl TokioCompactionExecutorInner {
                 let sst = finished_writer.close().await?;
 
                 self.stats.bytes_compacted.increment(sst.info.filter_offset);
+                self.stats.sst_files_written.increment(1);
                 output_ssts.push(sst);
                 bytes_written = 0;
                 let total_bytes = start_bytes_processed + all_iter.bytes_processed();
@@ -441,8 +445,18 @@ impl TokioCompactionExecutorInner {
             let sst = current_writer.close().await?;
 
             self.stats.bytes_compacted.increment(sst.info.filter_offset);
+            self.stats.sst_files_written.increment(1);
             output_ssts.push(sst);
         }
+
+        let elapsed_ms = self
+            .clock
+            .now()
+            .signed_duration_since(job_start)
+            .num_milliseconds();
+        self.stats
+            .compaction_duration_sec
+            .record((elapsed_ms.max(0) as f64) / 1000.0);
 
         Ok(SortedRun {
             id: args.destination,

@@ -937,6 +937,7 @@ impl CompactorEventHandler {
         self.state_mut()
             .update_compaction(&id, |c| c.set_status(CompactionStatus::Failed));
         self.state_writer.write_compactions_safely().await?;
+        self.stats.compactions_failed.increment(1);
         Ok(())
     }
 
@@ -956,6 +957,7 @@ impl CompactorEventHandler {
         self.stats
             .last_compaction_ts
             .set(self.system_clock.now().timestamp());
+        self.stats.compactions_completed.increment(1);
         Ok(())
     }
 
@@ -981,7 +983,9 @@ impl CompactorEventHandler {
 }
 
 pub mod stats {
-    use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper, UpDownCounterFn};
+    use slatedb_common::metrics::{
+        CounterFn, GaugeFn, HistogramFn, MetricsRecorderHelper, UpDownCounterFn, LATENCY_BOUNDARIES,
+    };
     use std::sync::Arc;
 
     pub use crate::merge_operator::MERGE_OPERATOR_OPERANDS;
@@ -1003,6 +1007,15 @@ pub mod stats {
         compactor_stat_name!("total_bytes_being_compacted");
     pub const TOTAL_THROUGHPUT_BYTES_PER_SEC: &str =
         compactor_stat_name!("total_throughput_bytes_per_sec");
+    pub const COMPACTIONS_COMPLETED: &str = compactor_stat_name!("compactions_completed");
+    pub const COMPACTIONS_FAILED: &str = compactor_stat_name!("compactions_failed");
+    pub const COMPACTION_DURATION_SEC: &str = compactor_stat_name!("compaction_duration_seconds");
+    pub const ENTRIES_WRITTEN: &str = compactor_stat_name!("entries_written");
+    pub const SST_FILES_WRITTEN: &str = compactor_stat_name!("sst_files_written");
+    pub const TOMBSTONES_CREATED: &str = compactor_stat_name!("tombstones_created");
+    pub const TOMBSTONES_DROPPED: &str = compactor_stat_name!("tombstones_dropped");
+    pub const RECORDS_DROPPED: &str = compactor_stat_name!("records_dropped");
+    pub const EXPIRED_MERGES_DROPPED: &str = compactor_stat_name!("expired_merges_dropped");
 
     pub(crate) struct CompactionStats {
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
@@ -1011,6 +1024,15 @@ pub mod stats {
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
         pub(crate) merge_operator_compact_operands: Arc<dyn CounterFn>,
+        pub(crate) compactions_completed: Arc<dyn CounterFn>,
+        pub(crate) compactions_failed: Arc<dyn CounterFn>,
+        pub(crate) compaction_duration_sec: Arc<dyn HistogramFn>,
+        pub(crate) entries_written: Arc<dyn CounterFn>,
+        pub(crate) sst_files_written: Arc<dyn CounterFn>,
+        pub(crate) tombstones_created: Arc<dyn CounterFn>,
+        pub(crate) tombstones_dropped: Arc<dyn CounterFn>,
+        pub(crate) records_dropped: Arc<dyn CounterFn>,
+        pub(crate) expired_merges_dropped: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1025,6 +1047,42 @@ pub mod stats {
                     .counter(MERGE_OPERATOR_OPERANDS)
                     .labels(&[(MERGE_OPERATOR_PATH_LABEL, MERGE_OPERATOR_COMPACT_PATH)])
                     .description(MERGE_OPERATOR_OPERANDS_DESCRIPTION)
+                    .register(),
+                compactions_completed: recorder
+                    .counter(COMPACTIONS_COMPLETED)
+                    .description("Number of compaction jobs that completed successfully")
+                    .register(),
+                compactions_failed: recorder
+                    .counter(COMPACTIONS_FAILED)
+                    .description("Number of compaction jobs that failed")
+                    .register(),
+                compaction_duration_sec: recorder
+                    .histogram(COMPACTION_DURATION_SEC, LATENCY_BOUNDARIES)
+                    .description("Duration of a compaction job in seconds")
+                    .register(),
+                entries_written: recorder
+                    .counter(ENTRIES_WRITTEN)
+                    .description("Number of key-value entries written to output SSTs during compaction")
+                    .register(),
+                sst_files_written: recorder
+                    .counter(SST_FILES_WRITTEN)
+                    .description("Number of output SST files produced by compaction")
+                    .register(),
+                tombstones_created: recorder
+                    .counter(TOMBSTONES_CREATED)
+                    .description("Number of tombstones created during compaction from entries whose TTL expired")
+                    .register(),
+                tombstones_dropped: recorder
+                    .counter(TOMBSTONES_DROPPED)
+                    .description("Number of trailing tombstones dropped during last-run compaction")
+                    .register(),
+                records_dropped: recorder
+                    .counter(RECORDS_DROPPED)
+                    .description("Number of older record versions dropped during compaction due to retention policy")
+                    .register(),
+                expired_merges_dropped: recorder
+                    .counter(EXPIRED_MERGES_DROPPED)
+                    .description("Number of expired merge-operator entries dropped during compaction")
                     .register(),
             }
         }
