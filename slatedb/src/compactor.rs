@@ -4270,4 +4270,197 @@ mod tests {
             false
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_records_completion_and_entries_metrics() {
+        use slatedb_common::metrics::{lookup_metric, MetricsRecorder};
+
+        let os = Arc::new(InMemory::new());
+        let system_clock = Arc::new(MockSystemClock::new());
+        let (metrics_recorder, _) = slatedb_common::metrics::test_recorder_helper();
+
+        let scheduler_options = SizeTieredCompactionSchedulerOptions {
+            min_compaction_sources: 1,
+            max_compaction_sources: 999,
+            include_size_threshold: 4.0,
+        }
+        .into();
+        let mut options = db_options(Some(compactor_options()));
+        options.l0_sst_size_bytes = 512;
+        options
+            .compactor_options
+            .as_mut()
+            .expect("compactor options must be set")
+            .scheduler_options = scheduler_options;
+
+        let db = Db::builder(PATH, os.clone())
+            .with_settings(options)
+            .with_system_clock(system_clock.clone())
+            .with_metrics_recorder(metrics_recorder.clone() as Arc<dyn MetricsRecorder>)
+            .build()
+            .await
+            .unwrap();
+
+        for i in 0..4u8 {
+            let k = vec![b'a' + i; 16];
+            let v = vec![b'b' + i; 48];
+            db.put_with_options(
+                &k,
+                &v,
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
+            let k = vec![b'j' + i; 16];
+            let v = vec![b'k' + i; 48];
+            db.put_with_options(
+                &k,
+                &v,
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let db_state = await_compaction(&db, Some(system_clock.clone())).await;
+        assert!(db_state.is_some(), "compaction did not complete");
+
+        let completed = lookup_metric(
+            metrics_recorder.as_ref(),
+            super::stats::COMPACTIONS_COMPLETED,
+        )
+        .unwrap_or(0);
+        assert!(
+            completed >= 1,
+            "expected at least one completed compaction, got {completed}"
+        );
+        assert!(
+            lookup_metric(metrics_recorder.as_ref(), super::stats::ENTRIES_WRITTEN).unwrap_or(0)
+                > 0
+        );
+        assert!(
+            lookup_metric(metrics_recorder.as_ref(), super::stats::SST_FILES_WRITTEN).unwrap_or(0)
+                > 0
+        );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_records_tombstone_metrics_for_expired_entries() {
+        use slatedb_common::metrics::{lookup_metric, MetricsRecorder};
+
+        let os = Arc::new(InMemory::new());
+        let insert_clock = Arc::new(MockSystemClock::new());
+        let (metrics_recorder, _) = slatedb_common::metrics::test_recorder_helper();
+
+        let scheduler_options = SizeTieredCompactionSchedulerOptions {
+            min_compaction_sources: 2,
+            max_compaction_sources: 2,
+            include_size_threshold: 4.0,
+        }
+        .into();
+        let mut options = db_options(Some(compactor_options()));
+        options.default_ttl = Some(50);
+        options
+            .compactor_options
+            .as_mut()
+            .expect("compactor options missing")
+            .scheduler_options = scheduler_options;
+
+        let db = Db::builder(PATH, os.clone())
+            .with_settings(options)
+            .with_system_clock(insert_clock.clone())
+            .with_metrics_recorder(metrics_recorder.clone() as Arc<dyn MetricsRecorder>)
+            .build()
+            .await
+            .unwrap();
+
+        let value = &[b'a'; 64];
+
+        // ticker time = 0, expire time = 10
+        insert_clock.set(0);
+        db.put_with_options(
+            &[1; 16],
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAfter(10),
+            },
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // ticker time = 10, expire time = 60 (using default TTL)
+        insert_clock.set(10);
+        db.put_with_options(
+            &[2; 16],
+            value,
+            &PutOptions { ttl: Ttl::Default },
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // ticker time = 30, no expire time
+        insert_clock.set(30);
+        db.put_with_options(
+            &[3; 16],
+            value,
+            &PutOptions { ttl: Ttl::NoExpiry },
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // revive key 1, ticker time = 70, expire time 150
+        insert_clock.set(70);
+        db.put_with_options(
+            &[1; 16],
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAfter(80),
+            },
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        let db_state = await_compaction(&db, Some(insert_clock)).await;
+        assert!(db_state.is_some(), "compaction did not complete");
+
+        // Key [1;16] was written at tick=0 with expire=10, so by compaction time (clock
+        // advanced significantly), it should be expired and converted to a tombstone.
+        let tombstones_created =
+            lookup_metric(metrics_recorder.as_ref(), super::stats::TOMBSTONES_CREATED).unwrap_or(0);
+        assert!(
+            tombstones_created > 0,
+            "expected at least one tombstone to be created for expired entry, got {tombstones_created}"
+        );
+
+        db.close().await.unwrap();
+    }
 }

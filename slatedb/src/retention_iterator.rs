@@ -1171,4 +1171,135 @@ mod tests {
             filtered, entry_seq, derived_ts, clock_now
         );
     }
+
+    #[cfg(feature = "test-util")]
+    mod stats {
+        use super::*;
+        use crate::compactor::stats::{
+            CompactionStats, EXPIRED_MERGES_DROPPED, RECORDS_DROPPED, TOMBSTONES_CREATED,
+            TOMBSTONES_DROPPED,
+        };
+        use crate::test_utils::TestIterator;
+        use slatedb_common::clock::MockSystemClock;
+        use slatedb_common::metrics::{
+            lookup_metric, test_recorder_helper, DefaultMetricsRecorder,
+        };
+
+        fn build_stats() -> (Arc<DefaultMetricsRecorder>, Arc<CompactionStats>) {
+            let (recorder, helper) = test_recorder_helper();
+            (recorder, Arc::new(CompactionStats::new(&helper)))
+        }
+
+        fn run_filter(
+            entries: Vec<RowEntry>,
+            compaction_start_ts: i64,
+            retention_min_seq: Option<u64>,
+            filter_tombstone: bool,
+            stats: Option<&Arc<CompactionStats>>,
+        ) -> BTreeMap<Reverse<u64>, RowEntry> {
+            let mut versions = BTreeMap::new();
+            for entry in entries {
+                versions.insert(Reverse(entry.seq), entry);
+            }
+            let system_clock = Arc::new(MockSystemClock::with_time(1000));
+            RetentionIterator::<TestIterator>::apply_retention_filter(
+                versions,
+                compaction_start_ts,
+                system_clock,
+                None,
+                retention_min_seq,
+                filter_tombstone,
+                Arc::new(SequenceTracker::new()),
+                stats,
+            )
+        }
+
+        #[test]
+        fn records_tombstones_created_for_expired_value() {
+            let (recorder, stats) = build_stats();
+            let entries = vec![RowEntry::new_value(b"k", b"v", 1)
+                .with_create_ts(900)
+                .with_expire_ts(950)];
+            let _ = run_filter(entries, 1000, None, false, Some(&stats));
+            assert_eq!(
+                lookup_metric(recorder.as_ref(), TOMBSTONES_CREATED),
+                Some(1)
+            );
+            assert_eq!(
+                lookup_metric(recorder.as_ref(), EXPIRED_MERGES_DROPPED),
+                Some(0)
+            );
+            assert_eq!(
+                lookup_metric(recorder.as_ref(), TOMBSTONES_DROPPED),
+                Some(0)
+            );
+            assert_eq!(lookup_metric(recorder.as_ref(), RECORDS_DROPPED), Some(0));
+        }
+
+        #[test]
+        fn records_expired_merges_dropped() {
+            let (recorder, stats) = build_stats();
+            let entries = vec![
+                RowEntry::new_merge(b"k", b"v", 2)
+                    .with_create_ts(900)
+                    .with_expire_ts(950),
+                RowEntry::new_merge(b"k", b"v", 1)
+                    .with_create_ts(850)
+                    .with_expire_ts(950),
+            ];
+            let _ = run_filter(entries, 1000, None, false, Some(&stats));
+            assert_eq!(
+                lookup_metric(recorder.as_ref(), EXPIRED_MERGES_DROPPED),
+                Some(2)
+            );
+            assert_eq!(
+                lookup_metric(recorder.as_ref(), TOMBSTONES_CREATED),
+                Some(0)
+            );
+        }
+
+        #[test]
+        fn records_records_dropped_for_old_versions_outside_retention() {
+            let (recorder, stats) = build_stats();
+            // 3 versions of one key, retention_min_seq=2 means seq=1 is dropped
+            // (loop stops at boundary value seq=2; one older version remains unconsumed).
+            let entries = vec![
+                RowEntry::new_value(b"k", b"v3", 3).with_create_ts(950),
+                RowEntry::new_value(b"k", b"v2", 2).with_create_ts(900),
+                RowEntry::new_value(b"k", b"v1", 1).with_create_ts(850),
+            ];
+            let _ = run_filter(entries, 1000, Some(2), false, Some(&stats));
+            assert_eq!(lookup_metric(recorder.as_ref(), RECORDS_DROPPED), Some(1));
+        }
+
+        #[test]
+        fn records_tombstones_dropped_for_trailing_tombstones() {
+            let (recorder, stats) = build_stats();
+            let entries = vec![
+                RowEntry::new_tombstone(b"k", 3).with_create_ts(950),
+                RowEntry::new_tombstone(b"k", 2).with_create_ts(900),
+                RowEntry::new_tombstone(b"k", 1).with_create_ts(850),
+            ];
+            let _ = run_filter(entries, 1000, None, true, Some(&stats));
+            // The retention loop only keeps the latest version, so only one trailing
+            // tombstone is in filtered_versions to be removed.
+            assert_eq!(
+                lookup_metric(recorder.as_ref(), TOMBSTONES_DROPPED),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn does_not_panic_when_stats_is_none() {
+            let entries = vec![
+                RowEntry::new_value(b"k", b"v", 1)
+                    .with_create_ts(900)
+                    .with_expire_ts(950),
+                RowEntry::new_merge(b"m", b"v", 1)
+                    .with_create_ts(900)
+                    .with_expire_ts(950),
+            ];
+            let _ = run_filter(entries, 1000, None, true, None);
+        }
+    }
 }
