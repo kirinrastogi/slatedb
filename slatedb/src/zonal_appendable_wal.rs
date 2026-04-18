@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
-use log::{error, trace};
+use log::trace;
 use object_store::path::Path;
 use tokio::{runtime::Handle, select, sync::oneshot};
 use tracing::instrument;
@@ -148,8 +148,6 @@ impl ZonalAppendableWalManager {
         let flush_handler = ZonalWalFlushHandler {
             max_flush_interval: self.max_flush_interval,
             manager: self.clone(),
-            active_writer: None,
-            current_wal_id: 0,
         };
 
         let result = task_executor.add_handler(
@@ -392,47 +390,68 @@ impl ZonalAppendableWalManager {
     /// Recover WAL entries from any partial (unfinalized) appendable objects.
     ///
     /// Call this before `init()` to recover entries from a crash. Scans WAL IDs
-    /// starting from `start_wal_id` and attempts to read partial appendable objects
-    /// via `tail_read`. Returns all recovered entries for replay into the memtable.
+    /// starting from `start_wal_id`, reads partial appendable objects via `tail_read`,
+    /// and rebuilds them as complete WAL SSTs (with footer) at new WAL IDs so that
+    /// the standard `WalReplayIterator` can read them.
     ///
-    /// After recovery, the partial objects can be finalized or left as-is (the
-    /// new writer will create fresh objects with new WAL IDs).
+    /// Returns the last WAL ID used for rebuilt SSTs, or `start_wal_id - 1` if
+    /// nothing was recovered. The caller should ensure WAL replay covers the
+    /// rebuilt IDs.
     pub(crate) async fn recover_partial_wals(
         &self,
         start_wal_id: u64,
-    ) -> Result<Vec<RowEntry>, SlateDBError> {
-        use crate::wal::streaming_wal_writer::recover_partial_wal;
+    ) -> Result<u64, SlateDBError> {
+        use crate::wal::streaming_wal_writer::{recover_partial_wal, rebuild_wal_sst};
         use log::info;
 
-        let mut all_entries = Vec::new();
         let mut wal_id = start_wal_id;
+        let mut last_rebuilt_id = start_wal_id.saturating_sub(1);
 
         loop {
             let path = self.wal_path(wal_id);
-            match self
-                .appendable_store
-                .tail_read(&path, 0)
-                .await
-            {
+            match self.appendable_store.tail_read(&path, 0).await {
                 Ok(data) if !data.is_empty() => {
                     info!(
                         "recovering partial WAL [wal_id={}, bytes={}]",
                         wal_id,
                         data.len()
                     );
-                    // Parse entries from the partial object
+                    // Parse entries from the partial object's length-prefixed blocks
                     let entries = recover_partial_wal(
                         self.appendable_store.as_ref(),
                         &path,
                         &self.sst_format,
                     )
                     .await?;
+
+                    if entries.is_empty() {
+                        info!("no valid entries in partial WAL [wal_id={}]", wal_id);
+                        wal_id += 1;
+                        continue;
+                    }
+
                     info!(
                         "recovered {} entries from partial WAL [wal_id={}]",
                         entries.len(),
                         wal_id
                     );
-                    all_entries.extend(entries);
+
+                    // Rebuild as a fresh complete SST at a new WAL ID
+                    let rebuilt_id = self.wal_id_incrementor.next_wal_id();
+                    let rebuilt_path = self.wal_path(rebuilt_id);
+                    rebuild_wal_sst(
+                        self.appendable_store.as_ref(),
+                        &rebuilt_path,
+                        &self.sst_format,
+                        &entries,
+                    )
+                    .await?;
+
+                    info!(
+                        "rebuilt partial WAL as complete SST [original_wal_id={}, rebuilt_wal_id={}]",
+                        wal_id, rebuilt_id
+                    );
+                    last_rebuilt_id = rebuilt_id;
                     wal_id += 1;
                 }
                 Ok(_) => {
@@ -446,7 +465,7 @@ impl ZonalAppendableWalManager {
             }
         }
 
-        Ok(all_entries)
+        Ok(last_rebuilt_id)
     }
 
     #[allow(dead_code)]
@@ -545,12 +564,6 @@ struct WalFlushWork {
 struct ZonalWalFlushHandler {
     max_flush_interval: Option<Duration>,
     manager: Arc<ZonalAppendableWalManager>,
-    /// The active streaming writer for the current appendable object.
-    /// Stays open across flush intervals; finalized when the object reaches
-    /// `max_wal_bytes_size`.
-    active_writer: Option<StreamingWalWriter>,
-    /// WAL ID of the current appendable object.
-    current_wal_id: u64,
 }
 
 #[async_trait]
@@ -592,13 +605,6 @@ impl MessageHandler<WalFlushWork> for ZonalWalFlushHandler {
             }
         }
 
-        // Best-effort: finalize the active writer if possible
-        if let Some(writer) = self.active_writer.take() {
-            if let Err(e) = writer.finalize().await {
-                error!("failed to finalize active writer during cleanup: {}", e);
-            }
-        }
-
         // Freeze current WAL and notify all pending WALs of the error
         self.manager.freeze_current_wal()?;
         let unflushed = self.manager.get_unflushed_pending_wals();
@@ -619,21 +625,16 @@ impl ZonalWalFlushHandler {
             return Ok(());
         }
 
-        // Ensure we have an active writer
-        if self.active_writer.is_none() {
-            self.current_wal_id = self.manager.wal_id_incrementor.next_wal_id();
-            let path = self.manager.wal_path(self.current_wal_id);
-            self.active_writer = Some(
-                StreamingWalWriter::new(
-                    self.manager.appendable_store.as_ref(),
-                    &path,
-                    &self.manager.sst_format,
-                )
-                .await?,
-            );
-        }
-
-        let writer = self.active_writer.as_mut().unwrap();
+        // Each flush creates a new appendable object, streams entries, and finalizes it.
+        // This ensures recent_flushed_wal_id advances on every flush.
+        let wal_id = self.manager.wal_id_incrementor.next_wal_id();
+        let path = self.manager.wal_path(wal_id);
+        let mut writer = StreamingWalWriter::new(
+            self.manager.appendable_store.as_ref(),
+            &path,
+            &self.manager.sst_format,
+        )
+        .await?;
 
         // Stream all unflushed pending WALs through the writer
         let mut last_tick = i64::MIN;
@@ -645,10 +646,13 @@ impl ZonalWalFlushHandler {
             last_tick = last_tick.max(wal.last_tick());
         }
 
-        // Finish partial block and flush for durability
-        writer.flush_pending().await?;
+        // Finalize: writes remaining blocks + footer, makes object immutable
+        let _handle = writer.finalize().await?;
 
         self.manager.db_stats.wal_buffer_flushes.increment(1);
+
+        // Advance recent_flushed_wal_id now that the WAL SST is complete with footer
+        self.manager.advance_recent_flushed_wal_id(wal_id);
 
         // Notify durability for each flushed WAL
         for wal in unflushed.iter() {
@@ -661,19 +665,6 @@ impl ZonalWalFlushHandler {
 
         self.manager.mono_clock.fetch_max_last_durable_tick(last_tick);
         self.manager.maybe_release_pending_wals();
-
-        // Check if we should finalize and roll over to a new appendable object
-        let write_offset = self
-            .active_writer
-            .as_ref()
-            .map(|w| w.write_offset())
-            .unwrap_or(0);
-        if write_offset >= self.manager.max_wal_bytes_size as i64 {
-            let writer = self.active_writer.take().unwrap();
-            let _handle = writer.finalize().await?;
-            self.manager
-                .advance_recent_flushed_wal_id(self.current_wal_id);
-        }
 
         let estimated_bytes = self.manager.estimated_bytes()?;
         self.manager
@@ -1082,7 +1073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_flushes_same_object() {
+    async fn test_multiple_flushes_create_separate_objects() {
         let (manager, appendable_store, _, _, _) = setup_zonal_wal().await;
 
         // First flush
@@ -1091,19 +1082,44 @@ mod tests {
             .unwrap();
         manager.flush().await.unwrap();
 
-        // Second flush — should append to the same object
+        // Second flush — creates a new finalized object
         manager
             .append(&[make_entry("key2", "value2", 2, None)])
             .unwrap();
         manager.flush().await.unwrap();
 
-        // Only one object should exist (same appendable object reused)
+        // Each flush creates and finalizes its own object
         let objects = appendable_store.objects.lock().await;
         assert_eq!(
             objects.len(),
-            1,
-            "Expected same appendable object to be reused"
+            2,
+            "Each flush should create a separate finalized object"
         );
+    }
+
+    #[tokio::test]
+    async fn test_recent_flushed_wal_id_advances_on_every_flush() {
+        let (manager, _, _, _, _) = setup_zonal_wal().await;
+
+        assert_eq!(manager.recent_flushed_wal_id(), 0);
+
+        manager
+            .append(&[make_entry("key1", "value1", 1, None)])
+            .unwrap();
+        manager.flush().await.unwrap();
+        assert_eq!(manager.recent_flushed_wal_id(), 1);
+
+        manager
+            .append(&[make_entry("key2", "value2", 2, None)])
+            .unwrap();
+        manager.flush().await.unwrap();
+        assert_eq!(manager.recent_flushed_wal_id(), 2);
+
+        manager
+            .append(&[make_entry("key3", "value3", 3, None)])
+            .unwrap();
+        manager.flush().await.unwrap();
+        assert_eq!(manager.recent_flushed_wal_id(), 3);
     }
 
     #[tokio::test]
@@ -1202,103 +1218,92 @@ mod tests {
 
     #[tokio::test]
     async fn test_crash_recovery_of_partial_wal() {
-        // Simulate: write entries → flush (durable in appendable object) → crash
-        // Then: create a new manager pointing at same store → recover entries
+        // Simulate: write entries to appendable object without footer → crash
+        // Then: recover → entries are rebuilt as a complete SST at a new WAL ID
         let appendable_store = Arc::new(MockAppendableStore::new());
+        let sst_format = SsTableFormat::default();
+
+        // Phase 1: manually write a partial WAL (blocks only, no footer)
+        {
+            use crate::wal::streaming_wal_writer::StreamingWalWriter;
+
+            let path = Path::from("/root/wal/00000000000000000001.sst");
+            let mut writer = StreamingWalWriter::new(
+                appendable_store.as_ref(),
+                &path,
+                &sst_format,
+            )
+            .await
+            .unwrap();
+
+            for i in 1..=5u64 {
+                writer
+                    .add(make_entry(
+                        &format!("key{}", i),
+                        &format!("value{}", i),
+                        i,
+                        Some(i as i64 * 100),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            // flush_pending writes blocks but does NOT write footer or finalize
+            writer.flush_pending().await.unwrap();
+            // Drop the writer without calling finalize() — simulates crash
+        }
+
+        // Verify partial object exists
+        let objects = appendable_store.objects.lock().await;
+        assert_eq!(objects.len(), 1);
+        drop(objects);
+
+        // Phase 2: create a recovery manager and recover
         let wal_id_store: Arc<dyn WalIdStore + Send + Sync> = Arc::new(MockWalIdStore {
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(10), // rebuilt SSTs will use IDs starting at 10
         });
         let test_clock = Arc::new(MockSystemClock::new());
         let mono_clock = Arc::new(MonotonicClock::new(test_clock.clone(), 0));
-        let system_clock = Arc::new(DefaultSystemClock::new());
         let status_manager = DbStatusManager::new(0);
         let oracle = Arc::new(DbOracle::new(0, 0, 0, status_manager.clone()));
         let recorder = Arc::new(DefaultMetricsRecorder::new());
         let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
         let db_stats = DbStats::new(&helper);
-        let sst_format = SsTableFormat::default();
 
-        // Phase 1: write and flush some entries
         let manager = Arc::new(ZonalAppendableWalManager::new(
             wal_id_store,
-            status_manager.clone(),
-            db_stats.clone(),
+            status_manager,
+            db_stats,
             0,
-            oracle.clone(),
+            oracle,
             appendable_store.clone(),
-            sst_format.clone(),
+            sst_format,
             "/root".to_string(),
-            mono_clock.clone(),
-            100_000, // large threshold so we don't finalize
-            Some(Duration::from_millis(10)),
-        ));
-        let task_executor = Arc::new(MessageHandlerExecutor::new(
-            Arc::new(status_manager.clone()),
-            system_clock.clone(),
-        ));
-        manager.init(task_executor.clone()).await.unwrap();
-        task_executor
-            .monitor_on(&Handle::current())
-            .expect("failed to monitor executor");
-
-        // Write 5 entries and flush
-        for i in 1..=5u64 {
-            let entry = make_entry(
-                &format!("key{}", i),
-                &format!("value{}", i),
-                i,
-                Some(i as i64 * 100),
-            );
-            manager.append(&[entry]).unwrap();
-        }
-        manager.flush().await.unwrap();
-
-        // Verify data is in the store
-        let objects = appendable_store.objects.lock().await;
-        assert_eq!(objects.len(), 1, "Should have one appendable object");
-        let data_len = {
-            let (_, data) = objects.iter().next().unwrap();
-            data.lock().await.len()
-        };
-        assert!(data_len > 0, "Appendable object should have data");
-        drop(objects);
-
-        // "Crash" — drop the manager without finalizing
-        drop(manager);
-
-        // Phase 2: create a new manager and recover
-        let wal_id_store2: Arc<dyn WalIdStore + Send + Sync> = Arc::new(MockWalIdStore {
-            next_id: AtomicU64::new(2), // would start after the crashed WAL
-        });
-        let oracle2 = Arc::new(DbOracle::new(0, 0, 0, status_manager.clone()));
-        let recovery_manager = Arc::new(ZonalAppendableWalManager::new(
-            wal_id_store2,
-            status_manager.clone(),
-            db_stats.clone(),
-            0, // recent_flushed_wal_id = 0 (nothing finalized)
-            oracle2,
-            appendable_store.clone(),
-            sst_format.clone(),
-            "/root".to_string(),
-            mono_clock.clone(),
+            mono_clock,
             100_000,
-            Some(Duration::from_millis(10)),
+            None,
         ));
 
-        // Recover from WAL ID 1 (the one we wrote to)
-        let recovered = recovery_manager.recover_partial_wals(1).await.unwrap();
+        // Recover from WAL ID 1 (the partial one)
+        let last_rebuilt_id = manager.recover_partial_wals(1).await.unwrap();
 
-        assert_eq!(recovered.len(), 5, "Should recover all 5 entries");
-        for (i, entry) in recovered.iter().enumerate() {
-            let expected_key = format!("key{}", i + 1);
-            assert_eq!(entry.key.as_ref(), expected_key.as_bytes());
-            assert_eq!(entry.seq, (i + 1) as u64);
-        }
+        // Should have rebuilt the SST at WAL ID 10
+        assert_eq!(last_rebuilt_id, 10);
+
+        // Verify the rebuilt SST exists in the store
+        let objects = appendable_store.objects.lock().await;
+        assert_eq!(objects.len(), 2, "Should have original partial + rebuilt SST");
+        // Path::from strips leading slash, so the key is "root/wal/..."
+        let rebuilt_path = Path::from("/root/wal/00000000000000000010.sst").to_string();
+        assert!(
+            objects.contains_key(&rebuilt_path),
+            "Rebuilt SST should exist at WAL ID 10, keys: {:?}",
+            objects.keys().collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
     async fn test_crash_recovery_empty_wal() {
-        // No partial WAL exists — recovery should return empty
+        // No partial WAL exists — recovery returns start_wal_id - 1
         let appendable_store = Arc::new(MockAppendableStore::new());
         let wal_id_store: Arc<dyn WalIdStore + Send + Sync> = Arc::new(MockWalIdStore {
             next_id: AtomicU64::new(1),
@@ -1326,18 +1331,18 @@ mod tests {
             None,
         ));
 
-        let recovered = manager.recover_partial_wals(1).await.unwrap();
-        assert!(recovered.is_empty(), "Should recover nothing from empty store");
+        let last_rebuilt_id = manager.recover_partial_wals(1).await.unwrap();
+        assert_eq!(last_rebuilt_id, 0, "Should return 0 (start_wal_id - 1) when nothing recovered");
     }
 
     #[tokio::test]
     async fn test_crash_recovery_with_trailing_garbage() {
-        // Write valid blocks then append garbage bytes — recovery should return
-        // only the valid entries and stop at the corrupt data
+        // Write valid blocks then append garbage → recovery should rebuild
+        // only the valid entries before the garbage
         let appendable_store = Arc::new(MockAppendableStore::new());
         let sst_format = SsTableFormat::default();
 
-        // Manually create an appendable object with valid blocks + garbage
+        // Manually create a partial WAL with valid blocks + trailing garbage
         {
             use crate::wal::streaming_wal_writer::StreamingWalWriter;
 
@@ -1350,7 +1355,6 @@ mod tests {
             .await
             .unwrap();
 
-            // Write 3 valid entries
             for i in 1..=3u64 {
                 writer
                     .add(make_entry(
@@ -1374,7 +1378,7 @@ mod tests {
 
         // Recover
         let wal_id_store: Arc<dyn WalIdStore + Send + Sync> = Arc::new(MockWalIdStore {
-            next_id: AtomicU64::new(2),
+            next_id: AtomicU64::new(10),
         });
         let test_clock = Arc::new(MockSystemClock::new());
         let mono_clock = Arc::new(MonotonicClock::new(test_clock.clone(), 0));
@@ -1390,7 +1394,7 @@ mod tests {
             db_stats,
             0,
             oracle,
-            appendable_store,
+            appendable_store.clone(),
             sst_format,
             "/root".to_string(),
             mono_clock,
@@ -1398,15 +1402,12 @@ mod tests {
             None,
         ));
 
-        let recovered = manager.recover_partial_wals(1).await.unwrap();
-        assert_eq!(
-            recovered.len(),
-            3,
-            "Should recover the 3 valid entries before the garbage"
-        );
-        for (i, entry) in recovered.iter().enumerate() {
-            let expected_key = format!("key{}", i + 1);
-            assert_eq!(entry.key.as_ref(), expected_key.as_bytes());
-        }
+        let last_rebuilt_id = manager.recover_partial_wals(1).await.unwrap();
+        assert_eq!(last_rebuilt_id, 10, "Should have rebuilt partial WAL");
+
+        // Verify rebuilt SST exists
+        let objects = appendable_store.objects.lock().await;
+        let rebuilt_path = Path::from("/root/wal/00000000000000000010.sst").to_string();
+        assert!(objects.contains_key(&rebuilt_path));
     }
 }

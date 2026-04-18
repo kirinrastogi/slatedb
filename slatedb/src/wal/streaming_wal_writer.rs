@@ -389,6 +389,29 @@ pub(crate) async fn recover_partial_wal(
     Ok(entries)
 }
 
+/// Rebuild a complete WAL SST from recovered entries.
+///
+/// Writes a fresh SST (data blocks + footer) to a new appendable object at the
+/// given path. The resulting file is a standard WAL SST readable by
+/// `table_store.open_sst()` and `WalReplayIterator`.
+///
+/// This is used during crash recovery: entries are first extracted from a partial
+/// appendable object (via [`recover_partial_wal`]), then re-encoded as a complete
+/// SST at a new location.
+pub(crate) async fn rebuild_wal_sst(
+    store: &(dyn AppendableStore + Send + Sync),
+    path: &Path,
+    format: &SsTableFormat,
+    entries: &[RowEntry],
+) -> Result<(), SlateDBError> {
+    let mut writer = StreamingWalWriter::new(store, path, format).await?;
+    for entry in entries {
+        writer.add(entry.clone()).await?;
+    }
+    writer.finalize().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
