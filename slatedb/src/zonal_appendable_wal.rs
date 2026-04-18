@@ -204,11 +204,7 @@ impl ZonalAppendableWalManager {
         let pending_size: usize = inner
             .pending_wals
             .iter()
-            .filter(|wal| {
-                wal.last_seq()
-                    .map(|s| s > last_durable_seq)
-                    .unwrap_or(true)
-            })
+            .filter(|wal| wal.last_seq().map(|s| s > last_durable_seq).unwrap_or(true))
             .map(|wal| {
                 self.sst_format
                     .estimate_encoded_size_wal(wal.len(), wal.size())
@@ -275,11 +271,7 @@ impl ZonalAppendableWalManager {
         // Check pending WALs that haven't been streamed yet
         let last_durable_seq = guard.oracle.last_remote_persisted_seq();
         for wal in guard.pending_wals.iter() {
-            if wal
-                .last_seq()
-                .map(|s| s > last_durable_seq)
-                .unwrap_or(true)
-            {
+            if wal.last_seq().map(|s| s > last_durable_seq).unwrap_or(true) {
                 return Some(wal.durable_watcher());
             }
         }
@@ -335,11 +327,7 @@ impl ZonalAppendableWalManager {
         inner
             .pending_wals
             .iter()
-            .filter(|wal| {
-                wal.last_seq()
-                    .map(|s| s > last_durable_seq)
-                    .unwrap_or(true)
-            })
+            .filter(|wal| wal.last_seq().map(|s| s > last_durable_seq).unwrap_or(true))
             .cloned()
             .collect()
     }
@@ -403,7 +391,7 @@ impl ZonalAppendableWalManager {
         &self,
         start_wal_id: u64,
     ) -> Result<u64, SlateDBError> {
-        use crate::wal::streaming_wal_writer::{recover_partial_wal, rebuild_wal_sst};
+        use crate::wal::streaming_wal_writer::{rebuild_wal_sst, recover_partial_wal};
         use log::info;
 
         let mut wal_id = start_wal_id;
@@ -654,7 +642,10 @@ impl ZonalWalFlushHandler {
             );
         }
 
-        let writer = self.active_writer.as_mut().unwrap();
+        let writer = self
+            .active_writer
+            .as_mut()
+            .expect("active_writer should be Some after the check above");
 
         // Stream all unflushed pending WALs through the writer
         let mut last_tick = i64::MIN;
@@ -687,14 +678,18 @@ impl ZonalWalFlushHandler {
             wal.notify_durable(Ok(()));
         }
 
-        self.manager.mono_clock.fetch_max_last_durable_tick(last_tick);
+        self.manager
+            .mono_clock
+            .fetch_max_last_durable_tick(last_tick);
         self.manager.maybe_release_pending_wals();
 
         // Check if we should finalize and roll over to a new appendable object
-        if writer.write_offset() >= self.manager.max_wal_bytes_size as i64 {
-            let writer = self.active_writer.take().unwrap();
-            let _handle = writer.finalize().await?;
-            // Next flush will create a new object with a new WAL ID
+        let should_finalize = writer.write_offset() >= self.manager.max_wal_bytes_size as i64;
+        if should_finalize {
+            if let Some(writer) = self.active_writer.take() {
+                let _handle = writer.finalize().await?;
+                // Next flush will create a new object with a new WAL ID
+            }
         }
 
         let estimated_bytes = self.manager.estimated_bytes()?;
@@ -719,8 +714,8 @@ mod tests {
     use bytes::Bytes;
     use object_store::path::Path;
     use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-        PutPayload, PutResult,
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutPayload, PutResult,
     };
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::metrics::{DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper};
@@ -902,11 +897,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn rename_if_not_exists(
-            &self,
-            _from: &Path,
-            _to: &Path,
-        ) -> object_store::Result<()> {
+        async fn rename_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
             unimplemented!()
         }
     }
@@ -935,11 +926,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn tail_read(
-            &self,
-            location: &Path,
-            offset: u64,
-        ) -> Result<Bytes, SlateDBError> {
+        async fn tail_read(&self, location: &Path, offset: u64) -> Result<Bytes, SlateDBError> {
             let objects = self.objects.lock().await;
             let key = location.to_string();
             match objects.get(&key) {
@@ -1211,7 +1198,11 @@ mod tests {
         manager.flush().await.unwrap();
 
         let objects = appendable_store.objects.lock().await;
-        assert_eq!(objects.len(), 0, "No objects should be created on empty flush");
+        assert_eq!(
+            objects.len(),
+            0,
+            "No objects should be created on empty flush"
+        );
     }
 
     #[tokio::test]
@@ -1264,8 +1255,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_size_based_flush_triggering() {
-        let (manager, _, _, _, _) =
-            setup_zonal_wal_with_flush_interval(Duration::MAX).await;
+        let (manager, _, _, _, _) = setup_zonal_wal_with_flush_interval(Duration::MAX).await;
 
         let mut seq = 1;
         while manager.estimated_bytes().unwrap() < manager.max_wal_bytes_size {
@@ -1289,13 +1279,9 @@ mod tests {
             use crate::wal::streaming_wal_writer::StreamingWalWriter;
 
             let path = Path::from("/root/wal/00000000000000000001.sst");
-            let mut writer = StreamingWalWriter::new(
-                appendable_store.as_ref(),
-                &path,
-                &sst_format,
-            )
-            .await
-            .unwrap();
+            let mut writer = StreamingWalWriter::new(appendable_store.as_ref(), &path, &sst_format)
+                .await
+                .unwrap();
 
             for i in 1..=5u64 {
                 writer
@@ -1352,7 +1338,11 @@ mod tests {
 
         // Verify the rebuilt SST exists in the store
         let objects = appendable_store.objects.lock().await;
-        assert_eq!(objects.len(), 2, "Should have original partial + rebuilt SST");
+        assert_eq!(
+            objects.len(),
+            2,
+            "Should have original partial + rebuilt SST"
+        );
         // Path::from strips leading slash, so the key is "root/wal/..."
         let rebuilt_path = Path::from("/root/wal/00000000000000000010.sst").to_string();
         assert!(
@@ -1393,7 +1383,10 @@ mod tests {
         ));
 
         let last_rebuilt_id = manager.recover_partial_wals(1).await.unwrap();
-        assert_eq!(last_rebuilt_id, 0, "Should return 0 (start_wal_id - 1) when nothing recovered");
+        assert_eq!(
+            last_rebuilt_id, 0,
+            "Should return 0 (start_wal_id - 1) when nothing recovered"
+        );
     }
 
     #[tokio::test]
@@ -1408,13 +1401,9 @@ mod tests {
             use crate::wal::streaming_wal_writer::StreamingWalWriter;
 
             let path = Path::from("/root/wal/00000000000000000001.sst");
-            let mut writer = StreamingWalWriter::new(
-                appendable_store.as_ref(),
-                &path,
-                &sst_format,
-            )
-            .await
-            .unwrap();
+            let mut writer = StreamingWalWriter::new(appendable_store.as_ref(), &path, &sst_format)
+                .await
+                .unwrap();
 
             for i in 1..=3u64 {
                 writer

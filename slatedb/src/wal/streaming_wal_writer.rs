@@ -95,11 +95,7 @@ pub(crate) trait AppendableStore: ObjectStore {
     ///
     /// # Errors
     /// Returns an error if the object doesn't exist or the offset is invalid
-    async fn tail_read(
-        &self,
-        location: &Path,
-        offset: u64,
-    ) -> Result<Bytes, SlateDBError>;
+    async fn tail_read(&self, location: &Path, offset: u64) -> Result<Bytes, SlateDBError>;
 }
 
 /// Writer for appending data to an appendable object.
@@ -350,9 +346,9 @@ pub(crate) async fn recover_partial_wal(
     path: &Path,
     format: &SsTableFormat,
 ) -> Result<Vec<RowEntry>, SlateDBError> {
-    use bytes::Buf;
     use crate::block_iterator_v2::BlockIteratorV2;
     use crate::iter::RowEntryIterator;
+    use bytes::Buf;
 
     let raw = store.tail_read(path, 0).await?;
     let mut entries = Vec::new();
@@ -419,7 +415,9 @@ mod tests {
     use crate::format::sst::SsTableFormat;
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
-    use object_store::{GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOpts, PutPayload};
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOpts, PutPayload,
+    };
     use std::sync::Arc;
     use std::sync::Mutex;
     use tokio::sync::Mutex as AsyncMutex;
@@ -509,19 +507,35 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for MockAppendableStore {
-        async fn put(&self, _location: &Path, _payload: PutPayload) -> object_store::Result<PutResult> {
+        async fn put(
+            &self,
+            _location: &Path,
+            _payload: PutPayload,
+        ) -> object_store::Result<PutResult> {
             unimplemented!("Use start_append instead")
         }
 
-        async fn put_opts(&self, _location: &Path, _payload: PutPayload, _opts: object_store::PutOptions) -> object_store::Result<PutResult> {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<PutResult> {
             unimplemented!("Use start_append instead")
         }
 
-        async fn put_multipart(&self, _location: &Path) -> object_store::Result<Box<dyn MultipartUpload>> {
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
             unimplemented!()
         }
 
-        async fn put_multipart_opts(&self, _location: &Path, _opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
             unimplemented!()
         }
 
@@ -530,11 +544,19 @@ mod tests {
             unimplemented!("get not needed for tests")
         }
 
-        async fn get_opts(&self, _location: &Path, _options: GetOptions) -> object_store::Result<GetResult> {
+        async fn get_opts(
+            &self,
+            _location: &Path,
+            _options: GetOptions,
+        ) -> object_store::Result<GetResult> {
             unimplemented!()
         }
 
-        async fn get_range(&self, _location: &Path, _range: std::ops::Range<u64>) -> object_store::Result<Bytes> {
+        async fn get_range(
+            &self,
+            _location: &Path,
+            _range: std::ops::Range<u64>,
+        ) -> object_store::Result<Bytes> {
             unimplemented!()
         }
 
@@ -546,15 +568,27 @@ mod tests {
             unimplemented!()
         }
 
-        fn list(&self, _prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
             Box::pin(futures::stream::empty())
         }
 
-        fn list_with_offset(&self, _prefix: Option<&Path>, _offset: &Path) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        fn list_with_offset(
+            &self,
+            _prefix: Option<&Path>,
+            _offset: &Path,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
             Box::pin(futures::stream::empty())
         }
 
-        async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
             unimplemented!()
         }
 
@@ -577,7 +611,10 @@ mod tests {
 
     #[async_trait]
     impl AppendableStore for MockAppendableStore {
-        async fn start_append(&self, location: &Path) -> Result<Box<dyn AppendWriter>, SlateDBError> {
+        async fn start_append(
+            &self,
+            location: &Path,
+        ) -> Result<Box<dyn AppendWriter>, SlateDBError> {
             let mut objects = self.objects.lock().await;
             // Check if object already exists (PutMode::Create semantics)
             if objects.contains_key(location) {
@@ -591,7 +628,11 @@ mod tests {
             Ok(Box::new(writer))
         }
 
-        async fn resume_append(&self, _location: &Path, _generation: i64) -> Result<Box<dyn AppendWriter>, SlateDBError> {
+        async fn resume_append(
+            &self,
+            _location: &Path,
+            _generation: i64,
+        ) -> Result<Box<dyn AppendWriter>, SlateDBError> {
             unimplemented!("Resume not needed for basic tests")
         }
 
