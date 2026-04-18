@@ -233,8 +233,7 @@ impl StreamingWalWriter {
 
         // Stream any completed blocks immediately
         while let Some(block) = self.builder.next_block() {
-            // Write block data
-            self.append_writer.write(block.encoded_bytes).await?;
+            self.write_block_framed(block.encoded_bytes).await?;
             self.blocks_written += 1;
 
             // Flush for durability after each block
@@ -261,7 +260,7 @@ impl StreamingWalWriter {
     pub(crate) async fn finalize(mut self) -> Result<SsTableHandle, SlateDBError> {
         // Write any remaining blocks
         while let Some(block) = self.builder.next_block() {
-            self.append_writer.write(block.encoded_bytes).await?;
+            self.write_block_framed(block.encoded_bytes).await?;
             self.blocks_written += 1;
         }
 
@@ -297,10 +296,25 @@ impl StreamingWalWriter {
     pub(crate) async fn flush_pending(&mut self) -> Result<(), SlateDBError> {
         self.builder.finish_block().await?;
         while let Some(block) = self.builder.next_block() {
-            self.append_writer.write(block.encoded_bytes).await?;
+            self.write_block_framed(block.encoded_bytes).await?;
             self.blocks_written += 1;
         }
         self.append_writer.flush().await?;
+        Ok(())
+    }
+
+    /// Write a block with a 4-byte big-endian length prefix.
+    ///
+    /// Format: `[u32 BE block_len][encoded_block_bytes]`
+    ///
+    /// This framing makes blocks self-delimiting, enabling crash recovery
+    /// by sequentially parsing blocks without needing the SST footer/index.
+    async fn write_block_framed(&mut self, block_bytes: Bytes) -> Result<(), SlateDBError> {
+        let len_prefix = (block_bytes.len() as u32).to_be_bytes();
+        self.append_writer
+            .write(Bytes::copy_from_slice(&len_prefix))
+            .await?;
+        self.append_writer.write(block_bytes).await?;
         Ok(())
     }
 
@@ -314,6 +328,65 @@ impl StreamingWalWriter {
     pub(crate) fn blocks_written(&self) -> usize {
         self.blocks_written
     }
+}
+
+/// Recover WAL entries from a partial appendable object that has length-prefixed
+/// blocks but no footer (e.g., after a crash before finalization).
+///
+/// Reads raw bytes via `tail_read`, parses sequential length-prefixed blocks,
+/// verifies checksums, decodes each block, and extracts all [`RowEntry`] items.
+///
+/// # Block framing format
+/// ```text
+/// [u32 BE block_len][encoded_block_bytes (block_len bytes)]
+/// [u32 BE block_len][encoded_block_bytes (block_len bytes)]
+/// ...
+/// ```
+///
+/// Any trailing bytes that don't form a complete framed block are silently
+/// skipped (they represent an incomplete write interrupted by a crash).
+pub(crate) async fn recover_partial_wal(
+    store: &(dyn AppendableStore + Send + Sync),
+    path: &Path,
+    format: &SsTableFormat,
+) -> Result<Vec<RowEntry>, SlateDBError> {
+    use bytes::Buf;
+    use crate::block_iterator_v2::BlockIteratorV2;
+    use crate::iter::RowEntryIterator;
+
+    let raw = store.tail_read(path, 0).await?;
+    let mut entries = Vec::new();
+    let mut cursor = raw.as_ref();
+
+    while cursor.len() >= 4 {
+        let block_len = cursor.get_u32() as usize;
+        if cursor.len() < block_len {
+            // Incomplete block — stop recovery here
+            break;
+        }
+        let block_bytes = Bytes::copy_from_slice(&cursor[..block_len]);
+        cursor = &cursor[block_len..];
+
+        // Decode block: validate checksum, reverse transform, decompress
+        let block = match format
+            .decode_block(block_bytes, format.compression_codec)
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => {
+                // Corrupt block — stop recovery (remaining data is unreliable)
+                break;
+            }
+        };
+
+        // Extract entries from the block
+        let mut iter = BlockIteratorV2::new_ascending(block);
+        while let Ok(Some(entry)) = iter.next().await {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

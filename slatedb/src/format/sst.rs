@@ -953,7 +953,7 @@ impl SsTableFormat {
         Ok(decoded_blocks)
     }
 
-    async fn decode_block(
+    pub(crate) async fn decode_block(
         &self,
         bytes: Bytes,
         compression_codec: Option<CompressionCodec>,
