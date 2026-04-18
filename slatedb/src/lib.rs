@@ -160,6 +160,7 @@ mod wal_buffer;
 mod wal_id;
 mod wal_reader;
 mod wal_replay;
+mod zonal_appendable_wal;
 
 // Initialize test infrastructure (deadlock detector, tracing) for all tests.
 // This ctor runs at crate load time, ensuring these are set up even for tests

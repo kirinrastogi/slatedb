@@ -146,7 +146,7 @@ impl EncodedWalSsTableBuilder {
             let first_seq_bytes = entry.seq.to_be_bytes();
             block_size = self.finish_block().await?;
             self.first_seq = Some(self.index_builder.create_vector(&first_seq_bytes));
-        } else if is_sst_first_seq {
+        } else if self.first_seq.is_none() {
             let first_seq_bytes = entry.seq.to_be_bytes();
             self.first_seq = Some(self.index_builder.create_vector(&first_seq_bytes));
         }
@@ -178,12 +178,11 @@ impl EncodedWalSsTableBuilder {
         self.add(entry).await
     }
 
-    #[cfg(test)]
     pub(crate) fn next_block(&mut self) -> Option<EncodedSsTableBlock> {
         self.blocks.pop_front()
     }
 
-    async fn finish_block(&mut self) -> Result<Option<usize>, SlateDBError> {
+    pub(crate) async fn finish_block(&mut self) -> Result<Option<usize>, SlateDBError> {
         if self.is_drained() {
             return Ok(None);
         }
