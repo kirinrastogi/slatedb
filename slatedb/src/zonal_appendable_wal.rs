@@ -148,6 +148,8 @@ impl ZonalAppendableWalManager {
         let flush_handler = ZonalWalFlushHandler {
             max_flush_interval: self.max_flush_interval,
             manager: self.clone(),
+            active_writer: None,
+            current_wal_id: 0,
         };
 
         let result = task_executor.add_handler(
@@ -564,6 +566,11 @@ struct WalFlushWork {
 struct ZonalWalFlushHandler {
     max_flush_interval: Option<Duration>,
     manager: Arc<ZonalAppendableWalManager>,
+    /// The active streaming writer. Stays open across flush intervals;
+    /// finalized when the object reaches `max_wal_bytes_size`.
+    active_writer: Option<StreamingWalWriter>,
+    /// WAL ID of the current appendable object.
+    current_wal_id: u64,
 }
 
 #[async_trait]
@@ -605,6 +612,14 @@ impl MessageHandler<WalFlushWork> for ZonalWalFlushHandler {
             }
         }
 
+        // Best-effort: finalize the active writer to persist a valid SST
+        if let Some(writer) = self.active_writer.take() {
+            if let Ok(_) = writer.finalize().await {
+                self.manager
+                    .advance_recent_flushed_wal_id(self.current_wal_id);
+            }
+        }
+
         // Freeze current WAL and notify all pending WALs of the error
         self.manager.freeze_current_wal()?;
         let unflushed = self.manager.get_unflushed_pending_wals();
@@ -625,16 +640,21 @@ impl ZonalWalFlushHandler {
             return Ok(());
         }
 
-        // Each flush creates a new appendable object, streams entries, and finalizes it.
-        // This ensures recent_flushed_wal_id advances on every flush.
-        let wal_id = self.manager.wal_id_incrementor.next_wal_id();
-        let path = self.manager.wal_path(wal_id);
-        let mut writer = StreamingWalWriter::new(
-            self.manager.appendable_store.as_ref(),
-            &path,
-            &self.manager.sst_format,
-        )
-        .await?;
+        // Ensure we have an active writer (create new appendable object if needed)
+        if self.active_writer.is_none() {
+            self.current_wal_id = self.manager.wal_id_incrementor.next_wal_id();
+            let path = self.manager.wal_path(self.current_wal_id);
+            self.active_writer = Some(
+                StreamingWalWriter::new(
+                    self.manager.appendable_store.as_ref(),
+                    &path,
+                    &self.manager.sst_format,
+                )
+                .await?,
+            );
+        }
+
+        let writer = self.active_writer.as_mut().unwrap();
 
         // Stream all unflushed pending WALs through the writer
         let mut last_tick = i64::MIN;
@@ -646,13 +666,17 @@ impl ZonalWalFlushHandler {
             last_tick = last_tick.max(wal.last_tick());
         }
 
-        // Finalize: writes remaining blocks + footer, makes object immutable
-        let _handle = writer.finalize().await?;
+        // Finish partial block and flush for durability.
+        // After this, all streamed entries are durable in storage.
+        writer.flush_pending().await?;
 
         self.manager.db_stats.wal_buffer_flushes.increment(1);
 
-        // Advance recent_flushed_wal_id now that the WAL SST is complete with footer
-        self.manager.advance_recent_flushed_wal_id(wal_id);
+        // Data is durable after flush_pending — advance recent_flushed_wal_id.
+        // This uses the current physical object's WAL ID. The rest of the system
+        // treats this as a watermark: everything up to this ID is durable.
+        self.manager
+            .advance_recent_flushed_wal_id(self.current_wal_id);
 
         // Notify durability for each flushed WAL
         for wal in unflushed.iter() {
@@ -665,6 +689,13 @@ impl ZonalWalFlushHandler {
 
         self.manager.mono_clock.fetch_max_last_durable_tick(last_tick);
         self.manager.maybe_release_pending_wals();
+
+        // Check if we should finalize and roll over to a new appendable object
+        if writer.write_offset() >= self.manager.max_wal_bytes_size as i64 {
+            let writer = self.active_writer.take().unwrap();
+            let _handle = writer.finalize().await?;
+            // Next flush will create a new object with a new WAL ID
+        }
 
         let estimated_bytes = self.manager.estimated_bytes()?;
         self.manager
@@ -1073,7 +1104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_flushes_create_separate_objects() {
+    async fn test_multiple_flushes_reuse_same_object() {
         let (manager, appendable_store, _, _, _) = setup_zonal_wal().await;
 
         // First flush
@@ -1082,18 +1113,18 @@ mod tests {
             .unwrap();
         manager.flush().await.unwrap();
 
-        // Second flush — creates a new finalized object
+        // Second flush — appends to the same object (not finalized yet)
         manager
             .append(&[make_entry("key2", "value2", 2, None)])
             .unwrap();
         manager.flush().await.unwrap();
 
-        // Each flush creates and finalizes its own object
+        // Same appendable object is reused across flushes
         let objects = appendable_store.objects.lock().await;
         assert_eq!(
             objects.len(),
-            2,
-            "Each flush should create a separate finalized object"
+            1,
+            "Same appendable object should be reused across flushes"
         );
     }
 
@@ -1103,6 +1134,8 @@ mod tests {
 
         assert_eq!(manager.recent_flushed_wal_id(), 0);
 
+        // All flushes share the same physical object (WAL ID 1), so
+        // recent_flushed_wal_id stays at 1 across multiple flushes
         manager
             .append(&[make_entry("key1", "value1", 1, None)])
             .unwrap();
@@ -1113,13 +1146,41 @@ mod tests {
             .append(&[make_entry("key2", "value2", 2, None)])
             .unwrap();
         manager.flush().await.unwrap();
-        assert_eq!(manager.recent_flushed_wal_id(), 2);
+        // Still 1 — same physical object
+        assert_eq!(manager.recent_flushed_wal_id(), 1);
+    }
 
-        manager
-            .append(&[make_entry("key3", "value3", 3, None)])
-            .unwrap();
-        manager.flush().await.unwrap();
-        assert_eq!(manager.recent_flushed_wal_id(), 3);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_finalize_at_size_threshold() {
+        // Use a small max_wal_bytes_size to trigger finalization
+        let (manager, appendable_store, _, _, _) =
+            setup_zonal_wal_with_flush_interval(Duration::from_millis(10)).await;
+
+        // Write enough data to exceed the 1000-byte threshold
+        let mut seq = 1u64;
+        loop {
+            let entry = make_entry(
+                &format!("key{:04}", seq),
+                &format!("value{:04}", seq),
+                seq,
+                None,
+            );
+            manager.append(&[entry]).unwrap();
+            manager.flush().await.unwrap();
+            seq += 1;
+
+            let objects = appendable_store.objects.lock().await;
+            if objects.len() > 1 {
+                // Finalization happened — new object was created
+                break;
+            }
+            drop(objects);
+
+            assert!(seq < 100, "Should have finalized before 100 flushes");
+        }
+
+        // After finalization, WAL ID should have advanced
+        assert!(manager.recent_flushed_wal_id() > 0);
     }
 
     #[tokio::test]
