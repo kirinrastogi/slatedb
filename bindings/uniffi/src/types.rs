@@ -373,6 +373,8 @@ pub enum SourceId {
     SortedRun(u32),
     /// L0 SST view ULID string.
     SstView(String),
+    /// Specific SST view within a sorted run (for file-level compaction).
+    SortedRunSst { sr_id: u32, view_id: String },
 }
 
 impl From<&CoreSourceId> for SourceId {
@@ -380,6 +382,10 @@ impl From<&CoreSourceId> for SourceId {
         match value {
             CoreSourceId::SortedRun(id) => Self::SortedRun(*id),
             CoreSourceId::SstView(id) => Self::SstView(id.to_string()),
+            CoreSourceId::SortedRunSst { sr_id, view_id } => Self::SortedRunSst {
+                sr_id: *sr_id,
+                view_id: view_id.to_string(),
+            },
         }
     }
 }
