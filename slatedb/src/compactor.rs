@@ -1202,6 +1202,107 @@ mod tests {
         assert!(expected.is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compactor_leveled_compaction_e2e() {
+        use crate::config::LeveledCompactionSchedulerOptions;
+        use crate::leveled_compaction::LeveledCompactionSchedulerSupplier;
+
+        // given:
+        let os = Arc::new(InMemory::new());
+        let system_clock = Arc::new(MockSystemClock::new());
+        let leveled_options = LeveledCompactionSchedulerOptions {
+            level0_file_num_compaction_trigger: 1,
+            // Small base so compaction cascades through levels quickly
+            max_bytes_for_level_base: 256,
+            max_bytes_for_level_multiplier: 10.0,
+            num_levels: 4,
+        };
+        let mut compactor_opts = compactor_options();
+        compactor_opts.scheduler_options = leveled_options.into();
+
+        let mut options = db_options(None);
+        // Bigger than all writes so we keep all writes in a single SST.
+        options.l0_sst_size_bytes = 512;
+
+        let db = Db::builder(PATH, os.clone())
+            .with_settings(options)
+            .with_system_clock(system_clock.clone())
+            .with_compactor_builder(
+                CompactorBuilder::new(PATH, os.clone())
+                    .with_options(compactor_opts)
+                    .with_scheduler_supplier(Arc::new(LeveledCompactionSchedulerSupplier::new())),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        let (_, _, table_store) = build_test_stores(os.clone());
+        let mut expected = std::collections::HashMap::<Vec<u8>, Vec<u8>>::new();
+        for i in 0..4 {
+            let k = vec![b'a' + i as u8; 16];
+            let v = vec![b'b' + i as u8; 48];
+            expected.insert(k.clone(), v.clone());
+            db.put_with_options(
+                &k,
+                &v,
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
+            let k = vec![b'j' + i as u8; 16];
+            let v = vec![b'k' + i as u8; 48];
+            db.put_with_options(
+                &k,
+                &v,
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
+            expected.insert(k.clone(), v.clone());
+        }
+
+        // Force all writes to L0.
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // when: wait for compaction to process L0 into leveled structure
+        let db_state = await_compaction(&db, Some(system_clock.clone())).await;
+
+        // then: verify all data is readable
+        let db_state = db_state.expect("db was not compacted");
+        for run in db_state.compacted {
+            for sst in run.sst_views {
+                let mut iter = SstIterator::new_borrowed_initialized(
+                    ..,
+                    &sst,
+                    table_store.clone(),
+                    SstIteratorOptions::default(),
+                )
+                .await
+                .unwrap()
+                .expect("Expected Some(iter) but got None");
+
+                while let Some(kv) = iter.next().await.unwrap().map(KeyValue::from) {
+                    let expected_v = expected
+                        .remove(kv.key.as_ref())
+                        .expect("removing unexpected key");
+                    let db_v = db.get(kv.key.as_ref()).await.unwrap().unwrap();
+                    assert_eq!(expected_v, db_v.as_ref());
+                }
+            }
+        }
+        assert!(expected.is_empty());
+    }
+
     #[cfg(feature = "wal_disable")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_tombstones_in_l0() {

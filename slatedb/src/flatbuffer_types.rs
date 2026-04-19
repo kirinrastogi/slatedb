@@ -1666,6 +1666,96 @@ mod tests {
     }
 
     #[test]
+    fn test_should_encode_decode_leveled_compaction_spec() {
+        // Tests that LeveledCompactionSpec round-trips correctly, including:
+        // 1. Explicit destination (different from min(sorted_runs))
+        // 2. SortedRunSst sources with per-SR SST selections
+
+        let view_id_1 = ulid::Ulid::new();
+        let view_id_2 = ulid::Ulid::new();
+        let view_id_3 = ulid::Ulid::new();
+
+        // File-level compaction: pick one SST from SR 5, two from SR 4
+        let compaction_partial = Compaction::new(
+            ulid::Ulid::new(),
+            CompactionSpec::new(
+                vec![
+                    SourceId::SortedRunSst {
+                        sr_id: 5,
+                        view_id: view_id_1,
+                    },
+                    SourceId::SortedRunSst {
+                        sr_id: 4,
+                        view_id: view_id_2,
+                    },
+                    SourceId::SortedRunSst {
+                        sr_id: 4,
+                        view_id: view_id_3,
+                    },
+                ],
+                4,
+            ),
+        )
+        .with_status(CompactionStatus::Running);
+
+        // Leveled whole-level compaction: destination != min(sorted_runs)
+        // SR 5 compacted to destination 4 (where SR 4 doesn't exist)
+        let compaction_leveled_dest = Compaction::new(
+            ulid::Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SortedRun(5)], 4),
+        )
+        .with_status(CompactionStatus::Submitted);
+
+        let mut compactions = Compactions::new(42);
+        compactions.insert(compaction_partial.clone());
+        compactions.insert(compaction_leveled_dest.clone());
+
+        let codec = FlatBufferCompactionsCodec {};
+        let bytes = codec.encode(&compactions);
+        let decoded = codec.decode(&bytes).expect("failed to decode");
+
+        // Verify file-level compaction round-trip
+        let decoded_partial = decoded
+            .get(&compaction_partial.id())
+            .expect("missing partial compaction");
+        assert_eq!(decoded_partial.spec(), compaction_partial.spec());
+        assert_eq!(decoded_partial.status(), CompactionStatus::Running);
+        assert_eq!(decoded_partial.spec().destination(), 4);
+        assert_eq!(decoded_partial.spec().sources().len(), 3);
+        assert_eq!(
+            decoded_partial.spec().sources()[0],
+            SourceId::SortedRunSst {
+                sr_id: 5,
+                view_id: view_id_1,
+            }
+        );
+        assert_eq!(
+            decoded_partial.spec().sources()[1],
+            SourceId::SortedRunSst {
+                sr_id: 4,
+                view_id: view_id_2,
+            }
+        );
+        assert_eq!(
+            decoded_partial.spec().sources()[2],
+            SourceId::SortedRunSst {
+                sr_id: 4,
+                view_id: view_id_3,
+            }
+        );
+
+        // Verify leveled whole-level destination round-trip
+        let decoded_leveled = decoded
+            .get(&compaction_leveled_dest.id())
+            .expect("missing leveled dest compaction");
+        assert_eq!(decoded_leveled.spec().destination(), 4);
+        assert_eq!(
+            decoded_leveled.spec().sources(),
+            &vec![SourceId::SortedRun(5)]
+        );
+    }
+
+    #[test]
     fn test_should_round_trip_compaction_statuses() {
         let statuses = [
             CompactionStatus::Submitted,

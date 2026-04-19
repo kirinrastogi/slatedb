@@ -893,7 +893,7 @@ mod tests {
     use crate::compactor_state::SourceId::SstView;
     use crate::config::{FlushOptions, FlushType, Settings};
     use crate::db::Db;
-    use crate::db_state::SsTableId;
+    use crate::db_state::{SsTableId, SsTableInfo};
     use crate::manifest::store::test_utils::new_dirty_manifest;
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::utils::IdGenerator;
@@ -1367,6 +1367,157 @@ mod tests {
 
         // or simply:
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_finish_compaction_with_sorted_run_sst_partial_removal() {
+        // Tests that finish_compaction with SortedRunSst sources:
+        // 1. Removes only the specified SSTs from source SRs (not the whole SR)
+        // 2. Splices output SSTs into the destination SR
+        // 3. Keeps remaining SSTs in source SRs
+
+        // Build state with two sorted runs (simulating L1=SR5, L2=SR4)
+        let mut dirty = new_dirty_manifest();
+        let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let rand = Arc::new(DbRand::default());
+
+        // L1 (SR 5): 3 SSTs
+        let l1_sst_0 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"a")),
+                last_entry: Some(bytes::Bytes::from_static(b"c")),
+                ..Default::default()
+            },
+        ));
+        let l1_sst_1 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"d")),
+                last_entry: Some(bytes::Bytes::from_static(b"f")),
+                ..Default::default()
+            },
+        ));
+        let l1_sst_2 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"g")),
+                last_entry: Some(bytes::Bytes::from_static(b"i")),
+                ..Default::default()
+            },
+        ));
+        let l1 = SortedRun {
+            id: 5,
+            sst_views: vec![l1_sst_0.clone(), l1_sst_1.clone(), l1_sst_2.clone()],
+        };
+
+        // L2 (SR 4): 2 SSTs
+        let l2_sst_0 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"a")),
+                last_entry: Some(bytes::Bytes::from_static(b"e")),
+                ..Default::default()
+            },
+        ));
+        let l2_sst_1 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"f")),
+                last_entry: Some(bytes::Bytes::from_static(b"z")),
+                ..Default::default()
+            },
+        ));
+        let l2 = SortedRun {
+            id: 4,
+            sst_views: vec![l2_sst_0.clone(), l2_sst_1.clone()],
+        };
+
+        dirty.value.core.compacted = vec![l1, l2];
+        let compactions = new_dirty_compactions(dirty.value.compactor_epoch);
+        let mut state = CompactorState::new(dirty, compactions);
+
+        // File-level compaction: pick l1_sst_0 from L1, merge with l2_sst_0 from L2
+        let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
+        let spec = CompactionSpec::new(
+            vec![
+                SourceId::SortedRunSst {
+                    sr_id: 5,
+                    view_id: l1_sst_0.id,
+                },
+                SourceId::SortedRunSst {
+                    sr_id: 4,
+                    view_id: l2_sst_0.id,
+                },
+            ],
+            4, // destination = L2
+        );
+        let compaction = Compaction::new(compaction_id, spec);
+        state
+            .add_compaction(compaction)
+            .expect("failed to add compaction");
+
+        // Simulate compaction output: 2 new SSTs that replace the merged ones
+        let output_sst_0 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"a")),
+                last_entry: Some(bytes::Bytes::from_static(b"c")),
+                ..Default::default()
+            },
+        ));
+        let output_sst_1 = SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(bytes::Bytes::from_static(b"d")),
+                last_entry: Some(bytes::Bytes::from_static(b"e")),
+                ..Default::default()
+            },
+        ));
+        let output_sr = SortedRun {
+            id: 4, // destination SR
+            sst_views: vec![output_sst_0.clone(), output_sst_1.clone()],
+        };
+
+        // when:
+        state.finish_compaction(compaction_id, output_sr);
+
+        // then:
+        let db_state = state.db_state();
+
+        // L1 (SR 5) should still exist with 2 remaining SSTs (sst_1 and sst_2)
+        let l1_after = db_state
+            .compacted
+            .iter()
+            .find(|sr| sr.id == 5)
+            .expect("L1 should still exist");
+        assert_eq!(l1_after.sst_views.len(), 2);
+        assert_eq!(l1_after.sst_views[0].id, l1_sst_1.id);
+        assert_eq!(l1_after.sst_views[1].id, l1_sst_2.id);
+
+        // L2 (SR 4) should have: output_sst_0, output_sst_1, l2_sst_1
+        // (l2_sst_0 was removed, output spliced in, l2_sst_1 kept)
+        let l2_after = db_state
+            .compacted
+            .iter()
+            .find(|sr| sr.id == 4)
+            .expect("L2 should still exist");
+        assert_eq!(l2_after.sst_views.len(), 3);
+        assert_eq!(l2_after.sst_views[0].id, output_sst_0.id);
+        assert_eq!(l2_after.sst_views[1].id, output_sst_1.id);
+        assert_eq!(l2_after.sst_views[2].id, l2_sst_1.id);
+
+        // Compacted list should still be in descending id order
+        assert_eq!(db_state.compacted.len(), 2);
+        assert_eq!(db_state.compacted[0].id, 5);
+        assert_eq!(db_state.compacted[1].id, 4);
     }
 
     // test helpers
