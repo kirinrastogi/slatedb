@@ -93,6 +93,7 @@ pub use crate::compactor_state::{
 };
 pub use crate::compactor_state_protocols::CompactorStateView;
 pub use crate::db::builder::CompactorBuilder;
+pub use crate::leveled_compaction::LeveledCompactionSchedulerSupplier;
 pub use crate::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 
 pub(crate) const COMPACTOR_TASK_NAME: &str = "compactor";
