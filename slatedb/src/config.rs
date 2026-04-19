@@ -1266,10 +1266,7 @@ impl From<LeveledCompactionSchedulerOptions> for HashMap<String, String> {
             "max_bytes_for_level_multiplier".to_string(),
             options.max_bytes_for_level_multiplier.to_string(),
         );
-        map.insert(
-            "num_levels".to_string(),
-            options.num_levels.to_string(),
-        );
+        map.insert("num_levels".to_string(), options.num_levels.to_string());
         map
     }
 }

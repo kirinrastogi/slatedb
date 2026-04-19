@@ -82,9 +82,9 @@ pub mod compactor;
 pub mod config;
 pub mod db_cache;
 pub mod db_stats;
+pub mod leveled_compaction;
 pub mod manifest;
 pub mod seq_tracker;
-pub mod leveled_compaction;
 pub mod size_tiered_compaction;
 
 mod batch;

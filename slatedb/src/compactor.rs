@@ -636,6 +636,16 @@ impl CompactorEventHandler {
                     .get(id)
                     .expect("compaction source sorted run not found")
                     .estimate_size(),
+                SourceId::SortedRunSst { sr_id, view_id } => {
+                    let sr = srs_by_id
+                        .get(sr_id)
+                        .expect("compaction source sorted run not found");
+                    sr.sst_views
+                        .iter()
+                        .find(|v| v.id == *view_id)
+                        .expect("compaction source SST view not found in sorted run")
+                        .estimate_size()
+                }
             })
             .sum()
     }
@@ -713,6 +723,7 @@ impl CompactorEventHandler {
         if let Some(missing) = compaction.sources().iter().find(|source| match source {
             SourceId::SstView(id) => !l0_view_ids.contains(id),
             SourceId::SortedRun(id) => !sr_ids.contains(id),
+            SourceId::SortedRunSst { sr_id, .. } => !sr_ids.contains(sr_id),
         }) {
             warn!("compaction source missing from db state: {:?}", missing);
             return Err(SlateDBError::InvalidCompaction);

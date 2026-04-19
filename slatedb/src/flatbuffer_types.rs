@@ -37,10 +37,11 @@ use crate::flatbuffer_types::root_generated::{
     CompactedSsTableArgs, CompactedSsTableV2, CompactedSsTableV2Args, CompactedSsTableView,
     CompactedSsTableViewArgs, Compaction as FbCompaction, CompactionArgs as FbCompactionArgs,
     CompactionSpec as FbCompactionSpec, CompactionStatus as FbCompactionStatus, CompactionsV1,
-    CompactionsV1Args, CompressionFormat, ManifestV1Args, SortedRun as FbSortedRunV1,
-    SortedRunArgs as FbSortedRunV1Args, SortedRunV2, SortedRunV2Args, SstType as FbSstType,
-    TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid,
-    UuidArgs,
+    CompactionsV1Args, CompressionFormat, LeveledCompactionSpec, LeveledCompactionSpecArgs,
+    ManifestV1Args, SortedRun as FbSortedRunV1, SortedRunArgs as FbSortedRunV1Args,
+    SortedRunSstSelection, SortedRunSstSelectionArgs, SortedRunV2, SortedRunV2Args,
+    SstType as FbSstType, TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid,
+    UlidArgs as FbUlidArgs, Uuid, UuidArgs,
 };
 use crate::format::sst::SST_FORMAT_VERSION;
 use crate::manifest::{ExternalDb, Manifest, ManifestCore};
@@ -543,6 +544,49 @@ impl FlatBufferCompactionsCodec {
                 let destination = sorted_runs.iter().copied().min().unwrap_or(0);
                 Ok(CompactorCompactionSpec::new(sources, destination))
             }
+            FbCompactionSpec::LeveledCompactionSpec => {
+                let Some(spec) = compaction.spec_as_leveled_compaction_spec() else {
+                    return Err(SlateDBError::InvalidCompaction);
+                };
+                let mut sources = Vec::new();
+                if let Some(view_ids) = spec.l0_view_ids() {
+                    sources.extend(view_ids.iter().map(|id| SourceId::SstView(id.ulid())));
+                }
+
+                // Collect per-SR SST selections (file-level compaction)
+                let mut sst_selections: std::collections::HashMap<u32, Vec<Ulid>> =
+                    std::collections::HashMap::new();
+                if let Some(selections) = spec.sr_sst_selections() {
+                    for sel in selections.iter() {
+                        if let Some(view_ids) = sel.view_ids() {
+                            let views: Vec<Ulid> = view_ids.iter().map(|id| id.ulid()).collect();
+                            sst_selections.insert(sel.sr_id(), views);
+                        }
+                    }
+                }
+
+                let sorted_runs: Vec<u32> = spec
+                    .sorted_runs()
+                    .map(|runs| runs.iter().collect())
+                    .unwrap_or_default();
+
+                // Add sources: SortedRunSst for partial selections, SortedRun for whole SRs
+                for sr_id in &sorted_runs {
+                    if let Some(view_ids) = sst_selections.get(sr_id) {
+                        for view_id in view_ids {
+                            sources.push(SourceId::SortedRunSst {
+                                sr_id: *sr_id,
+                                view_id: *view_id,
+                            });
+                        }
+                    } else {
+                        sources.push(SourceId::SortedRun(*sr_id));
+                    }
+                }
+
+                let destination = spec.destination();
+                Ok(CompactorCompactionSpec::new(sources, destination))
+            }
             _ => Err(SlateDBError::InvalidCompaction),
         }
     }
@@ -821,27 +865,84 @@ impl<'b> DbFlatBufferBuilder<'b> {
     ) -> (FbCompactionSpec, WIPOffset<flatbuffers::UnionWIPOffset>) {
         let mut view_ids = Vec::new();
         let mut sorted_runs = Vec::new();
+        let mut sst_selections: std::collections::HashMap<u32, Vec<Ulid>> =
+            std::collections::HashMap::new();
+        let mut has_sst_selections = false;
+
         for source in spec.sources().iter() {
             match source {
                 SourceId::SstView(id) => view_ids.push(*id),
                 SourceId::SortedRun(id) => sorted_runs.push(*id),
+                SourceId::SortedRunSst { sr_id, view_id } => {
+                    has_sst_selections = true;
+                    if !sorted_runs.contains(sr_id) {
+                        sorted_runs.push(*sr_id);
+                    }
+                    sst_selections.entry(*sr_id).or_default().push(*view_id);
+                }
             }
         }
-        let l0_view_ids = (!view_ids.is_empty()).then(|| self.add_ulids(view_ids.iter()));
-        let sorted_runs =
-            (!sorted_runs.is_empty()).then(|| self.builder.create_vector(sorted_runs.as_slice()));
-        let tiered_spec = TieredCompactionSpec::create(
-            &mut self.builder,
-            &TieredCompactionSpecArgs {
-                ssts: None,
-                sorted_runs,
-                l0_view_ids,
-            },
-        );
-        (
-            FbCompactionSpec::TieredCompactionSpec,
-            tiered_spec.as_union_value(),
-        )
+
+        // Use LeveledCompactionSpec if destination differs from min(sorted_runs)
+        // or if there are SortedRunSst sources. Otherwise use TieredCompactionSpec
+        // for backward compatibility.
+        let derived_dest = sorted_runs.iter().copied().min().unwrap_or(0);
+        let needs_leveled = spec.destination() != derived_dest || has_sst_selections;
+
+        if needs_leveled {
+            let l0_view_ids = (!view_ids.is_empty()).then(|| self.add_ulids(view_ids.iter()));
+            let sr_vec = (!sorted_runs.is_empty())
+                .then(|| self.builder.create_vector(sorted_runs.as_slice()));
+
+            let sr_sst_selections = if has_sst_selections {
+                let selections: Vec<_> = sst_selections
+                    .iter()
+                    .map(|(&sr_id, views)| {
+                        let view_ids = self.add_ulids(views.iter());
+                        SortedRunSstSelection::create(
+                            &mut self.builder,
+                            &SortedRunSstSelectionArgs {
+                                sr_id,
+                                view_ids: Some(view_ids),
+                            },
+                        )
+                    })
+                    .collect();
+                Some(self.builder.create_vector(&selections))
+            } else {
+                None
+            };
+
+            let leveled_spec = LeveledCompactionSpec::create(
+                &mut self.builder,
+                &LeveledCompactionSpecArgs {
+                    l0_view_ids,
+                    sorted_runs: sr_vec,
+                    destination: spec.destination(),
+                    sr_sst_selections,
+                },
+            );
+            (
+                FbCompactionSpec::LeveledCompactionSpec,
+                leveled_spec.as_union_value(),
+            )
+        } else {
+            let l0_view_ids = (!view_ids.is_empty()).then(|| self.add_ulids(view_ids.iter()));
+            let sorted_runs = (!sorted_runs.is_empty())
+                .then(|| self.builder.create_vector(sorted_runs.as_slice()));
+            let tiered_spec = TieredCompactionSpec::create(
+                &mut self.builder,
+                &TieredCompactionSpecArgs {
+                    ssts: None,
+                    sorted_runs,
+                    l0_view_ids,
+                },
+            );
+            (
+                FbCompactionSpec::TieredCompactionSpec,
+                tiered_spec.as_union_value(),
+            )
+        }
     }
 
     fn add_compaction(&mut self, compaction: &CompactorCompaction) -> WIPOffset<FbCompaction<'b>> {
