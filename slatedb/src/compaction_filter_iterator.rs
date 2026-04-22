@@ -3,26 +3,47 @@ use crate::error::SlateDBError;
 use crate::iter::{RowEntryIterator, TrackedRowEntryIterator};
 use crate::types::RowEntry;
 use async_trait::async_trait;
+use slatedb_common::metrics::CounterFn;
+use std::sync::Arc;
 
 /// Iterator that applies a compaction filter to entries during compaction.
 pub(crate) struct CompactionFilterIterator<T: RowEntryIterator> {
     inner: T,
     filter: Box<dyn CompactionFilter>,
+    kept_counter: Arc<dyn CounterFn>,
+    dropped_counter: Arc<dyn CounterFn>,
 }
 
 impl<T: RowEntryIterator> CompactionFilterIterator<T> {
     /// Creates a new CompactionFilterIterator.
-    pub(crate) fn new(inner: T, filter: Box<dyn CompactionFilter>) -> Self {
-        Self { inner, filter }
+    pub(crate) fn new(
+        inner: T,
+        filter: Box<dyn CompactionFilter>,
+        kept_counter: Arc<dyn CounterFn>,
+        dropped_counter: Arc<dyn CounterFn>,
+    ) -> Self {
+        Self {
+            inner,
+            filter,
+            kept_counter,
+            dropped_counter,
+        }
     }
 
     async fn apply_filter(&mut self, entry: RowEntry) -> Result<Option<RowEntry>, SlateDBError> {
         let decision = self.filter.filter(&entry).await?;
 
         match decision {
-            CompactionFilterDecision::Keep => Ok(Some(entry)),
-            CompactionFilterDecision::Drop => Ok(None),
+            CompactionFilterDecision::Keep => {
+                self.kept_counter.increment(1);
+                Ok(Some(entry))
+            }
+            CompactionFilterDecision::Drop => {
+                self.dropped_counter.increment(1);
+                Ok(None)
+            }
             CompactionFilterDecision::Modify(new_value) => {
+                self.kept_counter.increment(1);
                 // Clear expire_ts for tombstones, preserve for other values
                 let expire_ts = if new_value.is_tombstone() {
                     None
@@ -82,7 +103,14 @@ mod tests {
     use crate::compaction_filter::CompactionFilterError;
     use crate::types::ValueDeletable;
     use bytes::Bytes;
+    use slatedb_common::metrics::MetricsRecorderHelper;
     use std::collections::VecDeque;
+
+    fn noop_counter() -> Arc<dyn CounterFn> {
+        MetricsRecorderHelper::noop()
+            .counter("test.noop")
+            .register()
+    }
 
     struct MockIterator {
         entries: VecDeque<RowEntry>,
@@ -247,7 +275,7 @@ mod tests {
             make_entry(b"key3", b"value3", 3),
         ];
         let mock_iter = MockIterator::new(entries.clone());
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(KeepAllFilter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(KeepAllFilter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         let result1 = iter.next().await.unwrap();
@@ -275,7 +303,7 @@ mod tests {
         let filter = DropPrefixFilter {
             prefix: b"drop:".to_vec(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // Should skip drop:key1 and return keep:key2
@@ -300,7 +328,7 @@ mod tests {
         let filter = ModifyValueFilter {
             suffix: b"_modified".to_vec(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // Value should be modified
@@ -330,7 +358,7 @@ mod tests {
         let filter = TombstoneFilter {
             prefix: b"delete:".to_vec(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // delete:key1 should be converted to tombstone
@@ -366,7 +394,7 @@ mod tests {
         let filter = TombstoneFilter {
             prefix: b"delete:".to_vec(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // delete:key1 (value) should be converted to tombstone
@@ -421,7 +449,7 @@ mod tests {
         let filter = TrackingFilter {
             end_called: end_called.clone(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // Consume all entries
@@ -448,7 +476,7 @@ mod tests {
         let filter = TombstoneFilter {
             prefix: b"delete:".to_vec(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // delete:key1 should be converted to tombstone with expire_ts cleared
@@ -476,7 +504,7 @@ mod tests {
         let filter = ModifyValueFilter {
             suffix: b"_modified".to_vec(),
         };
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(filter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         let result = iter.next().await.unwrap().unwrap();
@@ -519,7 +547,7 @@ mod tests {
             make_entry(b"keep:key3", b"value3", 3),
         ];
         let mock_iter = MockIterator::new(entries.clone());
-        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(FailingFilter));
+        let mut iter = CompactionFilterIterator::new(mock_iter, Box::new(FailingFilter), noop_counter(), noop_counter());
         iter.init().await.unwrap();
 
         // First entry should succeed
