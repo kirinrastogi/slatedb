@@ -1,6 +1,8 @@
 use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
+use crate::compactor::stats::CompactionStats;
 use crate::compactor::{CompactionScheduler, CompactionSchedulerSupplier};
 use crate::compactor_state::{CompactionSpec, SourceId};
 use crate::compactor_state_protocols::CompactorStateView;
@@ -126,13 +128,19 @@ impl BackpressureChecker {
 struct CompactionChecker {
     conflict_checker: ConflictChecker,
     backpressure_checker: BackpressureChecker,
+    stats: Option<Arc<CompactionStats>>,
 }
 
 impl CompactionChecker {
-    fn new(conflict_checker: ConflictChecker, backpressure_checker: BackpressureChecker) -> Self {
+    fn new(
+        conflict_checker: ConflictChecker,
+        backpressure_checker: BackpressureChecker,
+        stats: Option<Arc<CompactionStats>>,
+    ) -> Self {
         Self {
             conflict_checker,
             backpressure_checker,
+            stats,
         }
     }
 
@@ -143,9 +151,15 @@ impl CompactionChecker {
         next_sr: Option<&CompactionSource>,
     ) -> bool {
         if !self.conflict_checker.check_compaction(sources, dst) {
+            if let Some(ref stats) = self.stats {
+                stats.conflict_rejections.increment(1);
+            }
             return false;
         }
         if !self.backpressure_checker.check_compaction(sources, next_sr) {
+            if let Some(ref stats) = self.stats {
+                stats.backpressure_rejections.increment(1);
+            }
             return false;
         }
         true
@@ -163,14 +177,16 @@ impl CompactionChecker {
 pub(crate) struct SizeTieredCompactionScheduler {
     options: SizeTieredCompactionSchedulerOptions,
     max_concurrent_compactions: usize,
+    stats: Option<Arc<CompactionStats>>,
 }
 
 impl Default for SizeTieredCompactionScheduler {
     fn default() -> Self {
-        Self::new(
-            SizeTieredCompactionSchedulerOptions::default(),
-            DEFAULT_MAX_CONCURRENT_COMPACTIONS,
-        )
+        SizeTieredCompactionScheduler {
+            options: SizeTieredCompactionSchedulerOptions::default(),
+            max_concurrent_compactions: DEFAULT_MAX_CONCURRENT_COMPACTIONS,
+            stats: None,
+        }
     }
 }
 
@@ -191,7 +207,8 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
             self.options.max_compaction_sources,
             &srs,
         );
-        let mut checker = CompactionChecker::new(conflict_checker, backpressure_checker);
+        let mut checker =
+            CompactionChecker::new(conflict_checker, backpressure_checker, self.stats.clone());
 
         while active_compactions.len() + compactions.len() < self.max_concurrent_compactions {
             let Some(compaction) = self.pick_next_compaction(&l0, &srs, &checker) else {
@@ -275,7 +292,13 @@ impl SizeTieredCompactionScheduler {
         Self {
             options,
             max_concurrent_compactions,
+            stats: None,
         }
+    }
+
+    pub(crate) fn with_stats(mut self, stats: Arc<CompactionStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     fn pick_next_compaction(
@@ -293,6 +316,9 @@ impl SizeTieredCompactionScheduler {
                 .map_or(0, |sr| sr.source.unwrap_sorted_run() + 1);
             let next_sr = srs.first();
             if checker.check_compaction(&l0_candidates, dst, next_sr) {
+                if let Some(ref stats) = self.stats {
+                    stats.l0_compactions_proposed.increment(1);
+                }
                 return Some(self.create_compaction(l0_candidates, dst));
             }
         }
@@ -313,6 +339,9 @@ impl SizeTieredCompactionScheduler {
                     .expect("expected non-empty compactable run")
                     .source
                     .unwrap_sorted_run();
+                if let Some(ref stats) = self.stats {
+                    stats.sr_compactions_proposed.increment(1);
+                }
                 return Some(self.create_compaction(compactable_run, dst));
             }
         }
@@ -398,11 +427,18 @@ impl SizeTieredCompactionScheduler {
 }
 
 #[derive(Default)]
-pub struct SizeTieredCompactionSchedulerSupplier;
+pub struct SizeTieredCompactionSchedulerSupplier {
+    stats: Option<Arc<CompactionStats>>,
+}
 
 impl SizeTieredCompactionSchedulerSupplier {
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self { stats: None }
+    }
+
+    pub(crate) fn with_stats(mut self, stats: Arc<CompactionStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 }
 
@@ -413,10 +449,14 @@ impl CompactionSchedulerSupplier for SizeTieredCompactionSchedulerSupplier {
     ) -> Box<dyn CompactionScheduler + Send + Sync> {
         let scheduler_options =
             SizeTieredCompactionSchedulerOptions::from(&compactor_options.scheduler_options);
-        Box::new(SizeTieredCompactionScheduler::new(
+        let mut scheduler = SizeTieredCompactionScheduler::new(
             scheduler_options,
             compactor_options.max_concurrent_compactions,
-        ))
+        );
+        if let Some(ref stats) = self.stats {
+            scheduler = scheduler.with_stats(stats.clone());
+        }
+        Box::new(scheduler)
     }
 }
 
@@ -471,7 +511,7 @@ mod tests {
     #[test]
     fn test_supplier_overrides_scheduler_options() {
         // given:
-        let supplier = SizeTieredCompactionSchedulerSupplier;
+        let supplier = SizeTieredCompactionSchedulerSupplier::new();
         let scheduler_options = SizeTieredCompactionSchedulerOptions {
             min_compaction_sources: 2,
             max_compaction_sources: 2,

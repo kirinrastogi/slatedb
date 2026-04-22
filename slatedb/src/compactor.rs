@@ -608,6 +608,25 @@ impl CompactorEventHandler {
             .total_bytes_being_compacted
             .set(total_estimated_bytes as i64);
         self.stats.total_throughput.set(total_throughput as i64);
+
+        // Manifest state gauges
+        self.stats.l0_sst_count.set(db_state.l0.len() as i64);
+        self.stats
+            .sorted_run_count
+            .set(db_state.compacted.len() as i64);
+        let total_sr_bytes: u64 = db_state.compacted.iter().map(|sr| sr.estimate_size()).sum();
+        self.stats.total_sr_size_bytes.set(total_sr_bytes as i64);
+        let total_sst_count: usize = db_state
+            .compacted
+            .iter()
+            .map(|sr| sr.sst_views.len())
+            .sum();
+        let avg_sst_bytes = if total_sst_count > 0 {
+            total_sr_bytes / total_sst_count as u64
+        } else {
+            0
+        };
+        self.stats.avg_sst_size_bytes.set(avg_sst_bytes as i64);
     }
 
     /// Calculates the estimated total source bytes for a compaction.
@@ -1016,6 +1035,27 @@ pub mod stats {
     pub const TOTAL_THROUGHPUT_BYTES_PER_SEC: &str =
         compactor_stat_name!("total_throughput_bytes_per_sec");
 
+    // Manifest state gauges
+    pub const L0_SST_COUNT: &str = compactor_stat_name!("l0_sst_count");
+    pub const SORTED_RUN_COUNT: &str = compactor_stat_name!("sorted_run_count");
+    pub const TOTAL_SR_SIZE_BYTES: &str = compactor_stat_name!("total_sr_size_bytes");
+    pub const AVG_SST_SIZE_BYTES: &str = compactor_stat_name!("avg_sst_size_bytes");
+
+    // Scheduler decision counters
+    pub const COMPACTIONS_PROPOSED_TOTAL: &str = compactor_stat_name!("compactions_proposed_total");
+    pub const BACKPRESSURE_REJECTIONS_TOTAL: &str =
+        compactor_stat_name!("backpressure_rejections_total");
+    pub const CONFLICT_REJECTIONS_TOTAL: &str = compactor_stat_name!("conflict_rejections_total");
+
+    // Per-job execution counters
+    pub const DEST_LAST_RUN_COMPACTIONS_TOTAL: &str =
+        compactor_stat_name!("dest_last_run_compactions_total");
+    pub const ENTRIES_WRITTEN_TOTAL: &str = compactor_stat_name!("entries_written_total");
+    pub const OUTPUT_TOMBSTONE_RATIO: &str = compactor_stat_name!("output_tombstone_ratio");
+
+    // Compaction filter decision counters
+    pub const FILTER_DECISIONS_TOTAL: &str = compactor_stat_name!("filter_decisions_total");
+
     pub(crate) struct CompactionStats {
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
         pub(crate) running_compactions: Arc<dyn UpDownCounterFn>,
@@ -1023,6 +1063,31 @@ pub mod stats {
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
         pub(crate) merge_operator_compact_operands: Arc<dyn CounterFn>,
+
+        // Manifest state gauges
+        pub(crate) l0_sst_count: Arc<dyn GaugeFn>,
+        pub(crate) sorted_run_count: Arc<dyn GaugeFn>,
+        pub(crate) total_sr_size_bytes: Arc<dyn GaugeFn>,
+        pub(crate) avg_sst_size_bytes: Arc<dyn GaugeFn>,
+
+        // Scheduler decision counters
+        pub(crate) l0_compactions_proposed: Arc<dyn CounterFn>,
+        pub(crate) sr_compactions_proposed: Arc<dyn CounterFn>,
+        pub(crate) backpressure_rejections: Arc<dyn CounterFn>,
+        pub(crate) conflict_rejections: Arc<dyn CounterFn>,
+
+        // Per-job execution counters
+        pub(crate) dest_last_run_compactions: Arc<dyn CounterFn>,
+        pub(crate) entries_written_puts: Arc<dyn CounterFn>,
+        pub(crate) entries_written_tombstones: Arc<dyn CounterFn>,
+        pub(crate) entries_written_merges: Arc<dyn CounterFn>,
+        pub(crate) output_tombstone_ratio: Arc<dyn GaugeFn>,
+
+        // Compaction filter decision counters
+        pub(crate) filter_kept_last_run: Arc<dyn CounterFn>,
+        pub(crate) filter_dropped_last_run: Arc<dyn CounterFn>,
+        pub(crate) filter_kept_non_last_run: Arc<dyn CounterFn>,
+        pub(crate) filter_dropped_non_last_run: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1037,6 +1102,62 @@ pub mod stats {
                     .counter(MERGE_OPERATOR_OPERANDS)
                     .labels(&[(MERGE_OPERATOR_PATH_LABEL, MERGE_OPERATOR_COMPACT_PATH)])
                     .description(MERGE_OPERATOR_OPERANDS_DESCRIPTION)
+                    .register(),
+
+                // Manifest state gauges
+                l0_sst_count: recorder.gauge(L0_SST_COUNT).register(),
+                sorted_run_count: recorder.gauge(SORTED_RUN_COUNT).register(),
+                total_sr_size_bytes: recorder.gauge(TOTAL_SR_SIZE_BYTES).register(),
+                avg_sst_size_bytes: recorder.gauge(AVG_SST_SIZE_BYTES).register(),
+
+                // Scheduler decision counters
+                l0_compactions_proposed: recorder
+                    .counter(COMPACTIONS_PROPOSED_TOTAL)
+                    .labels(&[("source_type", "l0")])
+                    .register(),
+                sr_compactions_proposed: recorder
+                    .counter(COMPACTIONS_PROPOSED_TOTAL)
+                    .labels(&[("source_type", "sr")])
+                    .register(),
+                backpressure_rejections: recorder
+                    .counter(BACKPRESSURE_REJECTIONS_TOTAL)
+                    .register(),
+                conflict_rejections: recorder.counter(CONFLICT_REJECTIONS_TOTAL).register(),
+
+                // Per-job execution counters
+                dest_last_run_compactions: recorder
+                    .counter(DEST_LAST_RUN_COMPACTIONS_TOTAL)
+                    .register(),
+                entries_written_puts: recorder
+                    .counter(ENTRIES_WRITTEN_TOTAL)
+                    .labels(&[("value_type", "put")])
+                    .register(),
+                entries_written_tombstones: recorder
+                    .counter(ENTRIES_WRITTEN_TOTAL)
+                    .labels(&[("value_type", "tombstone")])
+                    .register(),
+                entries_written_merges: recorder
+                    .counter(ENTRIES_WRITTEN_TOTAL)
+                    .labels(&[("value_type", "merge")])
+                    .register(),
+                output_tombstone_ratio: recorder.gauge(OUTPUT_TOMBSTONE_RATIO).register(),
+
+                // Compaction filter decision counters
+                filter_kept_last_run: recorder
+                    .counter(FILTER_DECISIONS_TOTAL)
+                    .labels(&[("decision", "kept"), ("is_last_run", "true")])
+                    .register(),
+                filter_dropped_last_run: recorder
+                    .counter(FILTER_DECISIONS_TOTAL)
+                    .labels(&[("decision", "dropped"), ("is_last_run", "true")])
+                    .register(),
+                filter_kept_non_last_run: recorder
+                    .counter(FILTER_DECISIONS_TOTAL)
+                    .labels(&[("decision", "kept"), ("is_last_run", "false")])
+                    .register(),
+                filter_dropped_non_last_run: recorder
+                    .counter(FILTER_DECISIONS_TOTAL)
+                    .labels(&[("decision", "dropped"), ("is_last_run", "false")])
                     .register(),
             }
         }

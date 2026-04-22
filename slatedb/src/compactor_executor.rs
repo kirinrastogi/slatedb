@@ -31,6 +31,7 @@ use crate::retention_iterator::RetentionIterator;
 use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
+use crate::types::ValueDeletable;
 use slatedb_common::clock::SystemClock;
 
 use crate::compactor::stats::CompactionStats;
@@ -343,7 +344,19 @@ impl TokioCompactionExecutorInner {
                 retention_min_seq: job_args.retention_min_seq,
             };
             let filter = supplier.create_compaction_filter(&context).await?;
-            let filter_iter = CompactionFilterIterator::new(retention_iter, filter);
+            let (kept_counter, dropped_counter) = if job_args.is_dest_last_run {
+                (
+                    self.stats.filter_kept_last_run.clone(),
+                    self.stats.filter_dropped_last_run.clone(),
+                )
+            } else {
+                (
+                    self.stats.filter_kept_non_last_run.clone(),
+                    self.stats.filter_dropped_non_last_run.clone(),
+                )
+            };
+            let filter_iter =
+                CompactionFilterIterator::new(retention_iter, filter, kept_counter, dropped_counter);
             let boxed: Box<dyn TrackedRowEntryIterator> = Box::new(filter_iter);
             let resuming_iter = ResumingIterator::new(boxed, resume_cursor).await?;
             return Ok(resuming_iter);
@@ -394,6 +407,11 @@ impl TokioCompactionExecutorInner {
         args: StartCompactionJobArgs,
     ) -> Result<SortedRun, SlateDBError> {
         debug!("executing compaction [job_args={:?}]", args);
+
+        if args.is_dest_last_run {
+            self.stats.dest_last_run_compactions.increment(1);
+        }
+
         let mut all_iter = self.load_iterators(&args).await?;
         let mut output_ssts = args.output_ssts.clone();
         let mut current_writer = self.table_store.table_writer(SsTableId::Compacted(
@@ -406,6 +424,9 @@ impl TokioCompactionExecutorInner {
             estimate_bytes_before_key(args.sorted_runs.as_slice(), k)
         });
 
+        let mut total_entries: u64 = 0;
+        let mut tombstone_entries: u64 = 0;
+
         while let Some(kv) = all_iter.next().await? {
             let duration_since_last_report =
                 self.clock.now().signed_duration_since(last_progress_report);
@@ -413,6 +434,17 @@ impl TokioCompactionExecutorInner {
                 let total_bytes = start_bytes_processed + all_iter.bytes_processed();
                 self.send_compaction_progress(args.id, total_bytes, &output_ssts);
                 last_progress_report = self.clock.now();
+            }
+
+            // Track output entry types
+            total_entries += 1;
+            match &kv.value {
+                ValueDeletable::Value(_) => self.stats.entries_written_puts.increment(1),
+                ValueDeletable::Tombstone => {
+                    tombstone_entries += 1;
+                    self.stats.entries_written_tombstones.increment(1);
+                }
+                ValueDeletable::Merge(_) => self.stats.entries_written_merges.increment(1),
             }
 
             if let Some(block_size) = current_writer.add(kv).await? {
@@ -442,6 +474,14 @@ impl TokioCompactionExecutorInner {
 
             self.stats.bytes_compacted.increment(sst.info.filter_offset);
             output_ssts.push(sst);
+        }
+
+        // Set tombstone ratio (permille) for this compaction job
+        if total_entries > 0 {
+            let ratio_permille = (tombstone_entries * 1000) / total_entries;
+            self.stats
+                .output_tombstone_ratio
+                .set(ratio_permille as i64);
         }
 
         Ok(SortedRun {

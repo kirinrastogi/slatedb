@@ -1058,7 +1058,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
 
         let scheduler_supplier = self
             .scheduler_supplier
-            .unwrap_or(Arc::new(SizeTieredCompactionSchedulerSupplier));
+            .unwrap_or(Arc::new(SizeTieredCompactionSchedulerSupplier::new()));
 
         Compactor::new(
             manifest_store,
@@ -1096,12 +1096,12 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     > {
         let options = Arc::new(self.options);
         let handle = self.compaction_runtime;
-        let scheduler_supplier = self
-            .scheduler_supplier
-            .unwrap_or(Arc::new(SizeTieredCompactionSchedulerSupplier));
+        let stats = Arc::new(CompactionStats::new(&self.recorder));
+        let scheduler_supplier = self.scheduler_supplier.unwrap_or(Arc::new(
+            SizeTieredCompactionSchedulerSupplier::new().with_stats(stats.clone()),
+        ));
         let (tx, rx) = async_channel::unbounded();
         let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&options));
-        let stats = Arc::new(CompactionStats::new(&self.recorder));
         let executor = Arc::new(TokioCompactionExecutor::new(
             TokioCompactionExecutorOptions {
                 handle,
