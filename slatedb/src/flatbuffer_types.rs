@@ -12,7 +12,7 @@ use crate::bytes_range::BytesRange;
 use crate::checkpoint;
 use crate::compactor_state::{
     Compaction as CompactorCompaction, CompactionSpec as CompactorCompactionSpec, CompactionStatus,
-    Compactions as CompactorCompactions, SourceId,
+    Compactions as CompactorCompactions, SortedRunSstSelection, SourceId,
 };
 use crate::db_state::{self, FilterFormat, SsTableInfo, SsTableInfoCodec, SstType};
 use crate::db_state::{SsTableHandle, SsTableView};
@@ -37,11 +37,14 @@ use crate::flatbuffer_types::root_generated::{
     CompactedSsTableArgs, CompactedSsTableV2, CompactedSsTableV2Args, CompactedSsTableView,
     CompactedSsTableViewArgs, Compaction as FbCompaction, CompactionArgs as FbCompactionArgs,
     CompactionSpec as FbCompactionSpec, CompactionStatus as FbCompactionStatus, CompactionsV1,
-    CompactionsV1Args, CompressionFormat, DrainSegmentSpec, DrainSegmentSpecArgs, ManifestV1Args,
-    Segment as FbSegment, SegmentArgs as FbSegmentArgs, SortedRun as FbSortedRunV1,
-    SortedRunArgs as FbSortedRunV1Args, SortedRunV2, SortedRunV2Args, SstType as FbSstType,
-    TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid,
-    UuidArgs,
+    CompactionsV1Args, CompressionFormat, DrainSegmentSpec, DrainSegmentSpecArgs,
+    LeveledCompactionSpec as FbLeveledCompactionSpec,
+    LeveledCompactionSpecArgs as FbLeveledCompactionSpecArgs, ManifestV1Args, Segment as FbSegment,
+    SegmentArgs as FbSegmentArgs, SortedRun as FbSortedRunV1, SortedRunArgs as FbSortedRunV1Args,
+    SortedRunSstSelection as FbSortedRunSstSelection,
+    SortedRunSstSelectionArgs as FbSortedRunSstSelectionArgs, SortedRunV2, SortedRunV2Args,
+    SstType as FbSstType, TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid,
+    UlidArgs as FbUlidArgs, Uuid, UuidArgs,
 };
 use crate::format::sst::SST_FORMAT_VERSION;
 use crate::manifest::{ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment};
@@ -659,6 +662,40 @@ impl FlatBufferCompactionsCodec {
                 let segment = Bytes::copy_from_slice(spec.segment().bytes());
                 Ok(CompactorCompactionSpec::drain_segment(segment, sources))
             }
+            FbCompactionSpec::LeveledCompactionSpec => {
+                let Some(spec) = compaction.spec_as_leveled_compaction_spec() else {
+                    return Err(SlateDBError::InvalidCompaction);
+                };
+                let sources: Vec<SourceId> = spec
+                    .sorted_runs()
+                    .map(|runs| runs.iter().map(SourceId::SortedRun).collect())
+                    .unwrap_or_default();
+                let destination = spec.destination();
+                let selections: Vec<SortedRunSstSelection> = spec
+                    .sr_sst_selections()
+                    .map(|sels| {
+                        sels.iter()
+                            .map(|s| SortedRunSstSelection {
+                                sr_id: s.sr_id(),
+                                view_ids: s
+                                    .view_ids()
+                                    .map(|v| v.iter().map(|u| u.ulid()).collect())
+                                    .unwrap_or_default(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let segment = spec
+                    .segment()
+                    .map(|s| Bytes::copy_from_slice(s.bytes()))
+                    .unwrap_or_default();
+                Ok(CompactorCompactionSpec::leveled_for_segment(
+                    segment,
+                    sources,
+                    destination,
+                    selections,
+                ))
+            }
             _ => Err(SlateDBError::InvalidCompaction),
         }
     }
@@ -984,50 +1021,102 @@ impl<'b> DbFlatBufferBuilder<'b> {
         &mut self,
         spec: &CompactorCompactionSpec,
     ) -> (FbCompactionSpec, WIPOffset<flatbuffers::UnionWIPOffset>) {
-        let mut view_ids = Vec::new();
-        let mut sorted_runs = Vec::new();
-        for source in spec.sources().iter() {
-            match source {
-                SourceId::SstView(id) => view_ids.push(*id),
-                SourceId::SortedRun(id) => sorted_runs.push(*id),
+        match spec {
+            CompactorCompactionSpec::Leveled(_) => self.add_leveled_compaction_spec(spec),
+            CompactorCompactionSpec::Tiered(_) | CompactorCompactionSpec::DrainSegment(_) => {
+                let mut view_ids = Vec::new();
+                let mut sorted_runs = Vec::new();
+                for source in spec.sources().iter() {
+                    match source {
+                        SourceId::SstView(id) => view_ids.push(*id),
+                        SourceId::SortedRun(id) => sorted_runs.push(*id),
+                    }
+                }
+                let l0_view_ids = (!view_ids.is_empty()).then(|| self.add_ulids(view_ids.iter()));
+                let sorted_runs = (!sorted_runs.is_empty())
+                    .then(|| self.builder.create_vector(sorted_runs.as_slice()));
+                let segment = self.builder.create_vector(spec.segment().as_ref());
+                match spec {
+                    CompactorCompactionSpec::Tiered(_) => {
+                        let tiered_spec = TieredCompactionSpec::create(
+                            &mut self.builder,
+                            &TieredCompactionSpecArgs {
+                                ssts: None,
+                                sorted_runs,
+                                destination: spec.destination().expect("tiered spec"),
+                                l0_view_ids,
+                                segment: Some(segment),
+                            },
+                        );
+                        (
+                            FbCompactionSpec::TieredCompactionSpec,
+                            tiered_spec.as_union_value(),
+                        )
+                    }
+                    CompactorCompactionSpec::DrainSegment(_) => {
+                        let drain_spec = DrainSegmentSpec::create(
+                            &mut self.builder,
+                            &DrainSegmentSpecArgs {
+                                segment: Some(segment),
+                                l0_view_ids,
+                                sorted_runs,
+                            },
+                        );
+                        (
+                            FbCompactionSpec::DrainSegmentSpec,
+                            drain_spec.as_union_value(),
+                        )
+                    }
+                    CompactorCompactionSpec::Leveled(_) => unreachable!(),
+                }
             }
         }
-        let l0_view_ids = (!view_ids.is_empty()).then(|| self.add_ulids(view_ids.iter()));
+    }
+
+    fn add_leveled_compaction_spec(
+        &mut self,
+        spec: &CompactorCompactionSpec,
+    ) -> (FbCompactionSpec, WIPOffset<flatbuffers::UnionWIPOffset>) {
+        let sorted_runs: Vec<u32> = spec
+            .sources()
+            .iter()
+            .filter_map(|s| s.maybe_unwrap_sorted_run())
+            .collect();
         let sorted_runs =
             (!sorted_runs.is_empty()).then(|| self.builder.create_vector(sorted_runs.as_slice()));
+
+        // Build SortedRunSstSelection table vector
+        let selection_offsets: Vec<WIPOffset<FbSortedRunSstSelection>> = spec
+            .sr_sst_selections()
+            .iter()
+            .map(|sel| {
+                let view_ids = self.add_ulids(sel.view_ids.iter());
+                FbSortedRunSstSelection::create(
+                    &mut self.builder,
+                    &FbSortedRunSstSelectionArgs {
+                        sr_id: sel.sr_id,
+                        view_ids: Some(view_ids),
+                    },
+                )
+            })
+            .collect();
+        let sr_sst_selections = (!selection_offsets.is_empty())
+            .then(|| self.builder.create_vector(selection_offsets.as_slice()));
+
         let segment = self.builder.create_vector(spec.segment().as_ref());
-        match spec {
-            CompactorCompactionSpec::Tiered(_) => {
-                let tiered_spec = TieredCompactionSpec::create(
-                    &mut self.builder,
-                    &TieredCompactionSpecArgs {
-                        ssts: None,
-                        sorted_runs,
-                        destination: spec.destination().expect("tiered spec"),
-                        l0_view_ids,
-                        segment: Some(segment),
-                    },
-                );
-                (
-                    FbCompactionSpec::TieredCompactionSpec,
-                    tiered_spec.as_union_value(),
-                )
-            }
-            CompactorCompactionSpec::DrainSegment(_) => {
-                let drain_spec = DrainSegmentSpec::create(
-                    &mut self.builder,
-                    &DrainSegmentSpecArgs {
-                        segment: Some(segment),
-                        l0_view_ids,
-                        sorted_runs,
-                    },
-                );
-                (
-                    FbCompactionSpec::DrainSegmentSpec,
-                    drain_spec.as_union_value(),
-                )
-            }
-        }
+        let leveled_spec = FbLeveledCompactionSpec::create(
+            &mut self.builder,
+            &FbLeveledCompactionSpecArgs {
+                sorted_runs,
+                destination: spec.destination().expect("leveled spec"),
+                sr_sst_selections,
+                segment: Some(segment),
+            },
+        );
+        (
+            FbCompactionSpec::LeveledCompactionSpec,
+            leveled_spec.as_union_value(),
+        )
     }
 
     fn add_compaction(&mut self, compaction: &CompactorCompaction) -> WIPOffset<FbCompaction<'b>> {

@@ -1220,6 +1220,108 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
     }
 }
 
+/// Options for the Leveled Compaction Scheduler.
+///
+/// Leveled compaction organizes data into levels L0..L(num_levels-1) where each
+/// level corresponds to a single sorted run. Level Ln (n>=1) maps to SR id
+/// `num_levels - 1 - n` so L1 holds the highest SR id (newest data) and the
+/// last level holds SR id 0.
+///
+/// L0 -> L1 compactions are still selected by size-tiered logic. Ln -> Ln+1
+/// (n >= 1) compactions are file-level (partial SR consumption) when possible.
+#[derive(Clone, Copy, Debug)]
+pub struct LeveledCompactionSchedulerOptions {
+    /// Number of L0 SSTs that triggers an L0 -> L1 compaction.
+    pub level0_file_num_compaction_trigger: usize,
+
+    /// Target byte size for L1.
+    pub max_bytes_for_level_base: u64,
+
+    /// Multiplier applied to the previous level's target size to compute the
+    /// next level's target size.
+    pub max_bytes_for_level_multiplier: f64,
+
+    /// Total number of levels (including L0). Must be at least 2.
+    pub num_levels: usize,
+}
+
+impl Default for LeveledCompactionSchedulerOptions {
+    fn default() -> Self {
+        Self {
+            level0_file_num_compaction_trigger: 4,
+            max_bytes_for_level_base: 256 * 1024 * 1024,
+            max_bytes_for_level_multiplier: 10.0,
+            num_levels: 7,
+        }
+    }
+}
+
+impl From<&HashMap<String, String>> for LeveledCompactionSchedulerOptions {
+    fn from(map: &HashMap<String, String>) -> Self {
+        let mut options = LeveledCompactionSchedulerOptions::default();
+        for (key, value) in map {
+            match key.as_str() {
+                "level0_file_num_compaction_trigger" => match value.parse::<usize>() {
+                    Ok(parsed) => options.level0_file_num_compaction_trigger = parsed,
+                    Err(err) => warn!(
+                        "invalid scheduler option value for level0_file_num_compaction_trigger: '{}': {}",
+                        value, err
+                    ),
+                },
+                "max_bytes_for_level_base" => match value.parse::<u64>() {
+                    Ok(parsed) => options.max_bytes_for_level_base = parsed,
+                    Err(err) => warn!(
+                        "invalid scheduler option value for max_bytes_for_level_base: '{}': {}",
+                        value, err
+                    ),
+                },
+                "max_bytes_for_level_multiplier" => match value.parse::<f64>() {
+                    Ok(parsed) => options.max_bytes_for_level_multiplier = parsed,
+                    Err(err) => warn!(
+                        "invalid scheduler option value for max_bytes_for_level_multiplier: '{}': {}",
+                        value, err
+                    ),
+                },
+                "num_levels" => match value.parse::<usize>() {
+                    Ok(parsed) => options.num_levels = parsed,
+                    Err(err) => warn!(
+                        "invalid scheduler option value for num_levels: '{}': {}",
+                        value, err
+                    ),
+                },
+                _ => warn!("unknown scheduler option '{}'; ignoring", key),
+            }
+        }
+        options
+    }
+}
+
+impl From<HashMap<String, String>> for LeveledCompactionSchedulerOptions {
+    fn from(map: HashMap<String, String>) -> Self {
+        Self::from(&map)
+    }
+}
+
+impl From<LeveledCompactionSchedulerOptions> for HashMap<String, String> {
+    fn from(options: LeveledCompactionSchedulerOptions) -> Self {
+        let mut map = HashMap::new();
+        map.insert(
+            "level0_file_num_compaction_trigger".to_string(),
+            options.level0_file_num_compaction_trigger.to_string(),
+        );
+        map.insert(
+            "max_bytes_for_level_base".to_string(),
+            options.max_bytes_for_level_base.to_string(),
+        );
+        map.insert(
+            "max_bytes_for_level_multiplier".to_string(),
+            options.max_bytes_for_level_multiplier.to_string(),
+        );
+        map.insert("num_levels".to_string(), options.num_levels.to_string());
+        map
+    }
+}
+
 /// Garbage collector options.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GarbageCollectorOptions {

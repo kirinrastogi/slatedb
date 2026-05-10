@@ -68,24 +68,37 @@ impl SourceId {
     }
 }
 
-/// Immutable spec that describes a compaction. Two variants are supported
-/// per RFC-0024:
+/// Specifies a partial selection of SST views from a sorted run.
+///
+/// Used by leveled compaction to consume only some of an SR's SSTs (file-level
+/// compaction) rather than the whole run.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortedRunSstSelection {
+    pub sr_id: u32,
+    pub view_ids: Vec<Ulid>,
+}
+
+/// Immutable spec that describes a compaction. Three variants are supported:
 ///
 /// - [`CompactionSpec::Tiered`] is the standard merge: read input sources,
 ///   write a single output sorted run with a destination id.
 /// - [`CompactionSpec::DrainSegment`] retires a named segment without
 ///   merging — the compactor names the L0s and SRs it has observed, and the
 ///   commit advances the segment's watermark and clears its `compacted` list.
+/// - [`CompactionSpec::Leveled`] is a leveled file-level merge: only the
+///   listed view ids are consumed from each source SR, and the result is
+///   spliced into the destination SR rather than replacing it.
 ///
-/// Every spec names exactly one segment (see RFC 24). For tiered specs an
-/// empty `segment` targets the compatibility-encoded `prefix=""` segment
-/// (root tree); a non-empty `segment` targets the named segment. Drain
-/// specs require a non-empty `segment` — the empty-prefix segment cannot
-/// be drained.
+/// Every spec names exactly one segment (see RFC 24). For tiered/leveled
+/// specs an empty `segment` targets the compatibility-encoded `prefix=""`
+/// segment (root tree); a non-empty `segment` targets the named segment.
+/// Drain specs require a non-empty `segment` — the empty-prefix segment
+/// cannot be drained.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CompactionSpec {
     Tiered(TieredCompactionSpec),
     DrainSegment(DrainSegmentSpec),
+    Leveled(LeveledCompactionSpec),
 }
 
 /// Tiered compaction spec: read inputs, merge into one output sorted run.
@@ -112,6 +125,24 @@ pub struct DrainSegmentSpec {
     /// L0 SSTs and sorted runs the compactor has observed in the segment
     /// and is draining.
     sources: Vec<SourceId>,
+}
+
+/// Leveled compaction spec: file-level (partial SR) merge from one or two
+/// sorted runs into a destination SR. Only the views listed in
+/// `sr_sst_selections` are read from a source SR; the remaining views stay
+/// in the source SR after the compaction commits. The output is spliced
+/// into the destination SR (rather than replacing it) when the destination
+/// SR already exists in the target tree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LeveledCompactionSpec {
+    /// Target segment prefix. Empty `Bytes` targets the `prefix=""` segment.
+    segment: Bytes,
+    /// Input sources for the compaction.
+    sources: Vec<SourceId>,
+    /// Destination sorted run id for the compaction output.
+    destination: u32,
+    /// Per-source-SR view selections for partial SR consumption.
+    sr_sst_selections: Vec<SortedRunSstSelection>,
 }
 
 impl CompactionSpec {
@@ -150,12 +181,65 @@ impl CompactionSpec {
         CompactionSpec::DrainSegment(DrainSegmentSpec { segment, sources })
     }
 
+    /// Creates a leveled compaction spec for a partial SR consumption
+    /// targeting the root tree (compatibility-encoded `prefix=""` segment).
+    /// `sources` must list `SortedRun(sr_id)` for every `sr_id` referenced in
+    /// `selections`; only the listed view ids will be merged into the
+    /// destination (the source SR's remaining views are preserved).
+    pub fn leveled(
+        sources: Vec<SourceId>,
+        destination: u32,
+        selections: Vec<SortedRunSstSelection>,
+    ) -> Self {
+        Self::leveled_for_segment(Bytes::new(), sources, destination, selections)
+    }
+
+    /// Creates a leveled compaction spec targeting the named segment. An
+    /// empty `segment` is equivalent to [`CompactionSpec::leveled`].
+    pub fn leveled_for_segment(
+        segment: Bytes,
+        sources: Vec<SourceId>,
+        destination: u32,
+        selections: Vec<SortedRunSstSelection>,
+    ) -> Self {
+        CompactionSpec::Leveled(LeveledCompactionSpec {
+            segment,
+            sources,
+            destination,
+            sr_sst_selections: selections,
+        })
+    }
+
+    /// Returns the per-SR view selections used for partial SR consumption.
+    /// Empty for tiered and drain specs.
+    pub fn sr_sst_selections(&self) -> &[SortedRunSstSelection] {
+        match self {
+            CompactionSpec::Leveled(s) => &s.sr_sst_selections,
+            _ => &[],
+        }
+    }
+
+    /// Returns the selected view ids for a given `sr_id`, if any.
+    pub(crate) fn selection_for(&self, sr_id: u32) -> Option<&Vec<Ulid>> {
+        self.sr_sst_selections()
+            .iter()
+            .find(|s| s.sr_id == sr_id)
+            .map(|s| &s.view_ids)
+    }
+
+    /// Returns true if this spec consumes only part of any SR (leveled with
+    /// non-empty selections).
+    pub fn is_partial(&self) -> bool {
+        !self.sr_sst_selections().is_empty()
+    }
+
     /// The target segment prefix. Empty bytes mean the compatibility-encoded
-    /// `prefix=""` segment (only valid for tiered specs).
+    /// `prefix=""` segment (only valid for tiered/leveled specs).
     pub fn segment(&self) -> &Bytes {
         match self {
             CompactionSpec::Tiered(s) => &s.segment,
             CompactionSpec::DrainSegment(s) => &s.segment,
+            CompactionSpec::Leveled(s) => &s.segment,
         }
     }
 
@@ -164,6 +248,7 @@ impl CompactionSpec {
         match self {
             CompactionSpec::Tiered(s) => &s.sources,
             CompactionSpec::DrainSegment(s) => &s.sources,
+            CompactionSpec::Leveled(s) => &s.sources,
         }
     }
 
@@ -173,12 +258,18 @@ impl CompactionSpec {
         match self {
             CompactionSpec::Tiered(s) => Some(s.destination),
             CompactionSpec::DrainSegment(_) => None,
+            CompactionSpec::Leveled(s) => Some(s.destination),
         }
     }
 
     /// Returns true if this is a [`CompactionSpec::DrainSegment`] spec.
     pub fn is_drain(&self) -> bool {
         matches!(self, CompactionSpec::DrainSegment(_))
+    }
+
+    /// Returns true if this is a [`CompactionSpec::Leveled`] spec.
+    pub fn is_leveled(&self) -> bool {
+        matches!(self, CompactionSpec::Leveled(_))
     }
 
     /// Returns true if any of the compaction sources are L0 SST views.
@@ -215,6 +306,26 @@ impl Display for CompactionSpec {
             }
             CompactionSpec::DrainSegment(_) => {
                 write!(f, "[seg={:?}] drain {:?}", segment, displayed_sources)
+            }
+            CompactionSpec::Leveled(spec) => {
+                let displayed_selections: Vec<String> = spec
+                    .sr_sst_selections
+                    .iter()
+                    .map(|s| format!("SR({}):{}views", s.sr_id, s.view_ids.len()))
+                    .collect();
+                if segment.is_empty() {
+                    write!(
+                        f,
+                        "{:?} -> SR({}) [leveled {:?}]",
+                        displayed_sources, spec.destination, displayed_selections
+                    )
+                } else {
+                    write!(
+                        f,
+                        "[seg={:?}] {:?} -> SR({}) [leveled {:?}]",
+                        segment, displayed_sources, spec.destination, displayed_selections
+                    )
+                }
             }
         }
     }
@@ -314,7 +425,24 @@ impl Compaction {
             .sources()
             .iter()
             .filter_map(|s| s.maybe_unwrap_sorted_run())
-            .filter_map(|id| srs_by_id.get(&id).map(|t| (*t).clone()))
+            .filter_map(|id| {
+                srs_by_id.get(&id).map(|sr| {
+                    if let Some(selected) = self.spec.selection_for(id) {
+                        let selected_set: HashSet<Ulid> = selected.iter().copied().collect();
+                        SortedRun {
+                            id: sr.id,
+                            sst_views: sr
+                                .sst_views
+                                .iter()
+                                .filter(|v| selected_set.contains(&v.id))
+                                .cloned()
+                                .collect(),
+                        }
+                    } else {
+                        (*sr).clone()
+                    }
+                })
+            })
             .collect()
     }
 
@@ -808,6 +936,12 @@ impl CompactorState {
                 .chain(std::iter::once(&SourceId::SortedRun(dst)))
                 .filter_map(|id| id.maybe_unwrap_sorted_run())
                 .collect();
+            let partial_selections: HashMap<u32, HashSet<Ulid>> = spec
+                .sr_sst_selections()
+                .iter()
+                .map(|sel| (sel.sr_id, sel.view_ids.iter().copied().collect()))
+                .collect();
+            let destination = dst;
             let first_source = *spec
                 .sources()
                 .first()
@@ -837,10 +971,44 @@ impl CompactorState {
             let mut inserted = false;
             for compacted in tree.compacted.iter() {
                 if !inserted && output_sr.id >= compacted.id {
-                    new_compacted.push(output_sr.clone());
+                    // For partial destination compactions, splice the new
+                    // output views into the existing destination SR rather
+                    // than replacing it.
+                    let dest_to_push = if let Some(selected) = partial_selections.get(&destination)
+                    {
+                        if compacted.id == destination {
+                            let merged = Self::splice_partial_dest(compacted, selected, &output_sr);
+                            new_compacted.push(merged);
+                            inserted = true;
+                            continue;
+                        } else {
+                            output_sr.clone()
+                        }
+                    } else {
+                        output_sr.clone()
+                    };
+                    new_compacted.push(dest_to_push);
                     inserted = true;
                 }
-                if !compaction_srs.contains(&compacted.id) {
+
+                if compaction_srs.contains(&compacted.id) {
+                    if let Some(selected) = partial_selections.get(&compacted.id) {
+                        // Partial source SR: keep the remaining views.
+                        let remaining: Vec<SsTableView> = compacted
+                            .sst_views
+                            .iter()
+                            .filter(|v| !selected.contains(&v.id))
+                            .cloned()
+                            .collect();
+                        if !remaining.is_empty() {
+                            new_compacted.push(SortedRun {
+                                id: compacted.id,
+                                sst_views: remaining,
+                            });
+                        }
+                    }
+                    // else: whole SR consumed, drop it.
+                } else {
                     new_compacted.push(compacted.clone());
                 }
             }
@@ -895,11 +1063,11 @@ impl CompactorState {
         info!("finished drain compaction [spec={}]", spec);
         let drain = match spec {
             CompactionSpec::DrainSegment(d) => d.clone(),
-            CompactionSpec::Tiered(_) => {
+            CompactionSpec::Tiered(_) | CompactionSpec::Leveled(_) => {
                 #[allow(clippy::panic)]
                 {
                     panic!(
-                        "finish_drain_compaction called on a tiered spec [compaction_id={}]",
+                        "finish_drain_compaction called on a non-drain spec [compaction_id={}]",
                         compaction_id
                     );
                 }
@@ -951,6 +1119,39 @@ impl CompactorState {
         self.update_compaction(&compaction_id, |c| {
             c.set_status(CompactionStatus::Completed);
         });
+    }
+
+    /// For partial-destination leveled compactions, replaces `selected` views
+    /// inside `existing` (the prior destination SR) with the views from
+    /// `output_sr`, preserving the SR's overall key order. Both `existing`
+    /// and `output_sr` are already sorted by key, and `output_sr`'s views
+    /// occupy the key range of the removed selections.
+    fn splice_partial_dest(
+        existing: &SortedRun,
+        selected: &HashSet<Ulid>,
+        output_sr: &SortedRun,
+    ) -> SortedRun {
+        let mut merged: Vec<SsTableView> = Vec::with_capacity(
+            existing.sst_views.len().saturating_sub(selected.len()) + output_sr.sst_views.len(),
+        );
+        let mut output_inserted = false;
+        for view in existing.sst_views.iter() {
+            if selected.contains(&view.id) {
+                if !output_inserted {
+                    merged.extend(output_sr.sst_views.iter().cloned());
+                    output_inserted = true;
+                }
+            } else {
+                merged.push(view.clone());
+            }
+        }
+        if !output_inserted {
+            merged.extend(output_sr.sst_views.iter().cloned());
+        }
+        SortedRun {
+            id: existing.id,
+            sst_views: merged,
+        }
     }
 
     /// Debug assertion that compacted sorted runs are kept in strictly descending id order.

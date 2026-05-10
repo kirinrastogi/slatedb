@@ -84,6 +84,7 @@ pub mod compactor;
 pub mod config;
 pub mod db_cache;
 pub mod db_stats;
+pub mod leveled_compaction;
 pub mod manifest;
 pub mod prefix_extractor;
 pub mod seq_tracker;

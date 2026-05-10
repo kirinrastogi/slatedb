@@ -4,6 +4,13 @@ include "sst.fbs";
 union CompactionSpec {
     TieredCompactionSpec,
     DrainSegmentSpec,
+    LeveledCompactionSpec,
+}
+
+// A selection of specific SST views from a sorted run for file-level compaction.
+table SortedRunSstSelection {
+    sr_id: uint32;
+    view_ids: [Ulid];
 }
 
 enum CompactionStatus : byte {
@@ -61,6 +68,27 @@ table DrainSegmentSpec {
     // Sorted Run IDs the compactor has observed in the segment and is
     // draining. These runs are removed from the segment's compacted list.
     sorted_runs: [uint32];
+}
+
+// Compaction spec for leveled compaction with explicit destination.
+// L0 -> L1 still uses TieredCompactionSpec (size-tiered). This spec is
+// used for Ln -> Ln+1 (n >= 1) compactions, which may be partial via
+// `sr_sst_selections`.
+table LeveledCompactionSpec {
+    // input Sorted Run IDs (whole SRs)
+    sorted_runs: [uint32];
+
+    // explicit destination sorted run ID
+    destination: uint32;
+
+    // specific SST views to select from each sorted run.
+    // Only the listed views are included
+    // (the SR is partially consumed, not destroyed).
+    sr_sst_selections: [SortedRunSstSelection];
+
+    // Target segment prefix. Empty bytes target the compatibility-encoded
+    // `prefix=""` segment (root tree).
+    segment: [ubyte];
 }
 
 table Compaction {
