@@ -178,6 +178,18 @@ impl LeveledCompactionScheduler {
         let src_sr = self.sr_at_level(db_state, level)?;
         let src_sr_id = src_sr.id;
         let picked = &src_sr.sst_views[0];
+        let dst_existing = self.sr_at_level(db_state, level + 1);
+
+        // Skip no-op cascades: if the source has only one SST view AND there
+        // is no destination SR yet, the "cascade" would just rename the SR
+        // (move the lone SST to a new id with smaller value, drop the now-
+        // empty source). That doesn't reduce L1's over-target condition —
+        // the renamed SR becomes the new L1 — and would cycle indefinitely
+        // until sr_id hits 0. Wait for more data to accumulate so the
+        // source has at least 2 SSTs and the cascade actually splits it.
+        if dst_existing.is_none() && src_sr.sst_views.len() <= 1 {
+            return None;
+        }
 
         let mut sources = vec![SourceId::SortedRun(src_sr_id)];
         let mut selections = vec![SortedRunSstSelection {
@@ -185,7 +197,7 @@ impl LeveledCompactionScheduler {
             view_ids: vec![picked.id],
         }];
 
-        let dst_sr_id = if let Some(dst_sr) = self.sr_at_level(db_state, level + 1) {
+        let dst_sr_id = if let Some(dst_sr) = dst_existing {
             let start_key = picked.compacted_effective_start_key();
             let end_key = picked.sst.info.last_entry.as_ref().unwrap_or(start_key);
             let overlapping = Self::find_overlapping_sst_ids(dst_sr, start_key, end_key);
@@ -231,6 +243,12 @@ impl LeveledCompactionScheduler {
     /// compaction) is folded in as an additional source and the destination
     /// is L1's id. This keeps L1 as a single growing SR instead of
     /// fragmenting into a new SR each flush.
+    ///
+    /// If no L1 exists yet (bootstrap case), rewrites the destination to a
+    /// value at least `num_levels - 1` so that subsequent cascades have id
+    /// headroom below L1. The size-tiered delegate would otherwise hand us
+    /// `0` as the first destination, making `fresh_deeper_sr_id` unable to
+    /// allocate L2's id (since L2 needs an id strictly less than L1's).
     fn fold_l1_into_l0_spec(
         &self,
         db_state: &ManifestCore,
@@ -240,15 +258,44 @@ impl LeveledCompactionScheduler {
         if !spec.segment().is_empty() {
             return spec;
         }
-        let Some(l1) = self.sr_at_level(db_state, 1) else {
-            return spec;
-        };
-        if Self::is_sr_id_in_active_compaction(active, l1.id) {
-            return spec;
+        if let Some(l1) = self.sr_at_level(db_state, 1) {
+            if Self::is_sr_id_in_active_compaction(active, l1.id) {
+                return spec;
+            }
+            let mut sources = spec.sources().to_vec();
+            sources.push(SourceId::SortedRun(l1.id));
+            return CompactionSpec::for_segment(spec.segment().clone(), sources, l1.id);
         }
-        let mut sources = spec.sources().to_vec();
-        sources.push(SourceId::SortedRun(l1.id));
-        CompactionSpec::for_segment(spec.segment().clone(), sources, l1.id)
+
+        // Bootstrap: no L1 exists. Replace the size-tiered destination with
+        // an id that leaves room for `num_levels - 1` cascades below it.
+        let dest = self.bootstrap_l1_dest(db_state, active, spec.destination());
+        CompactionSpec::for_segment(spec.segment().clone(), spec.sources().to_vec(), dest)
+    }
+
+    /// Picks the destination id for the first L0 -> L1 round (no L1 exists
+    /// yet). Must be globally unique (not taken by any committed SR or any
+    /// in-flight compaction destination) and at least `num_levels - 1` so
+    /// the cascade has room to allocate deeper levels below.
+    fn bootstrap_l1_dest(
+        &self,
+        db_state: &ManifestCore,
+        active: &[&CompactionSpec],
+        size_tiered_dest: Option<u32>,
+    ) -> u32 {
+        let mut taken: HashSet<u32> = db_state.tree.compacted.iter().map(|sr| sr.id).collect();
+        for spec in active {
+            if let Some(d) = spec.destination() {
+                taken.insert(d);
+            }
+        }
+        let st = size_tiered_dest.unwrap_or(0);
+        let headroom = self.options.num_levels.saturating_sub(1) as u32;
+        let mut candidate = st.max(headroom);
+        while taken.contains(&candidate) {
+            candidate = candidate.saturating_add(1);
+        }
+        candidate
     }
 }
 
@@ -274,23 +321,29 @@ impl CompactionScheduler for LeveledCompactionScheduler {
             .map(|c| c.spec())
             .collect();
 
+        // Pick the cascade (Ln -> Ln+1) BEFORE folding L1 into L0 specs.
+        // Order matters: the fold-in claims L1 as destination, which would
+        // otherwise mask L1 from `is_sr_id_in_active_compaction` and block
+        // the cascade indefinitely while L0 keeps firing. Picking the
+        // cascade first means a busy L1 (drain into L2 in progress) will
+        // suppress the fold-in for one round, which is the right behavior.
+        let cascade = self.pick_level_compaction(db_state, &pre_active);
+        let active_after_cascade: Vec<&CompactionSpec> =
+            pre_active.iter().copied().chain(cascade.iter()).collect();
+
         // Fold the existing L1 SR into each L0 spec so L1 grows as a single
-        // SR instead of fragmenting.
-        let mut compactions: Vec<CompactionSpec> = l0_specs
+        // SR. Skipped automatically when L1 is busy (e.g. just-picked L1->L2
+        // cascade), in which case the L0 spec keeps its size-tiered fresh
+        // destination id and a new transient SR appears; that SR becomes the
+        // new L1 once the old L1's cascade completes.
+        let l0_compactions: Vec<CompactionSpec> = l0_specs
             .into_iter()
-            .map(|spec| self.fold_l1_into_l0_spec(db_state, &pre_active, spec))
+            .map(|spec| self.fold_l1_into_l0_spec(db_state, &active_after_cascade, spec))
             .collect();
 
-        let active: Vec<&CompactionSpec> = pre_active
-            .iter()
-            .copied()
-            .chain(compactions.iter())
-            .collect();
-
-        if let Some(spec) = self.pick_level_compaction(db_state, &active) {
-            compactions.push(spec);
-        }
-
+        let mut compactions = Vec::new();
+        compactions.extend(cascade);
+        compactions.extend(l0_compactions);
         compactions
     }
 

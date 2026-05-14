@@ -1386,6 +1386,213 @@ mod tests {
         assert!(expected.is_empty());
     }
 
+    /// End-to-end cascade test for `LeveledCompactionScheduler`.
+    ///
+    /// Drives a real `Db` configured with very small per-level targets so
+    /// that the leveled cascade triggers within seconds, and verifies:
+    /// (a) L0 -> L1 fold-in: repeated L0->L1 rounds reuse L1's SR id
+    ///     instead of allocating a fresh SR each flush
+    ///     (catches the L1-fragmentation bug — under that bug `compacted`
+    ///     would grow one SR per flush, each ~the same size as L0).
+    /// (b) Cascade L1 -> L2 -> L3: once L1 exceeds its target,
+    ///     `pick_level_compaction` produces an Ln -> Ln+1 spec that
+    ///     creates a new deeper SR with id < L1's id
+    ///     (catches the static-mapping bug — under that bug the cascade
+    ///     would never trigger because the first L1's sr_id of 0 mapped
+    ///     to "L6" with a 25 TiB target).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_leveled_compaction_cascade_pushes_data_down() {
+        use crate::config::LeveledCompactionSchedulerOptions;
+        use crate::leveled_compaction::LeveledCompactionSchedulerSupplier;
+
+        // Helpers scoped to this test.
+        async fn snapshot(ms: &Arc<ManifestStore>) -> ManifestCore {
+            let sm = StoredManifest::load(ms.clone(), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+            sm.db_state().clone()
+        }
+
+        async fn wait_for_compacted_condition<F: Fn(&ManifestCore) -> bool>(
+            ms: &Arc<ManifestStore>,
+            timeout: Duration,
+            cond: F,
+        ) -> Option<ManifestCore> {
+            run_for(timeout, || async {
+                let s = snapshot(ms).await;
+                if cond(&s) {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .await
+        }
+
+        // Assert that compacted is in strictly descending id order.
+        fn assert_compacted_desc(core: &ManifestCore) {
+            let mut last: Option<u32> = None;
+            for sr in &core.tree.compacted {
+                if let Some(prev) = last {
+                    assert!(
+                        prev > sr.id,
+                        "compacted not in strictly descending id order: prev={prev} cur={}",
+                        sr.id,
+                    );
+                }
+                last = Some(sr.id);
+            }
+        }
+
+        // Force a memtable flush; ignore errors caused by shutdown races.
+        async fn flush_memtable(db: &Db) {
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        }
+
+        // ----- Build the Db -----
+        // L1 target is set well above one SST-builder block (~4 KiB) so that
+        // L1 accumulates multiple compacted SSTs before overflowing. With a
+        // single-SST L1, the partial-SR cascade would just rename the SR
+        // each round (1 SST moved, 0 remaining; no new compacted entry).
+        let os = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(PATH), os.clone()));
+
+        let scheduler_opts: HashMap<String, String> = LeveledCompactionSchedulerOptions {
+            level0_file_num_compaction_trigger: 4,
+            max_bytes_for_level_base: 16 * 1024,
+            max_bytes_for_level_multiplier: 2.0,
+            num_levels: 5,
+        }
+        .into();
+
+        let mut settings = db_options(Some(compactor_options()));
+        settings.l0_sst_size_bytes = 1024;
+
+        let system_clock = Arc::new(DefaultSystemClock::new());
+        let mut leveled_compactor_opts = compactor_options();
+        // max_sst_size must be smaller than the SST builder's default 4 KiB
+        // block size so that each block boundary forces an SST roll. Without
+        // this, all compaction output lands in a single SST regardless of
+        // total size, and the partial-SR cascade would have nothing to split.
+        leveled_compactor_opts.max_sst_size = 512;
+        leveled_compactor_opts.scheduler_options = scheduler_opts;
+
+        let compactor_builder = crate::db::builder::CompactorBuilder::new(PATH, os.clone())
+            .with_system_clock(system_clock.clone())
+            .with_options(leveled_compactor_opts)
+            .with_scheduler_supplier(Arc::new(LeveledCompactionSchedulerSupplier::new()));
+
+        let db = Db::builder(PATH, os.clone())
+            .with_settings(settings)
+            .with_system_clock(system_clock.clone())
+            .with_compactor_builder(compactor_builder)
+            .build()
+            .await
+            .unwrap();
+
+        // Helper: write `n` key/value pairs of ~256 B each under a prefix.
+        async fn write_batch(db: &Db, prefix: u8, n: u32) {
+            for i in 0..n {
+                let k = format!("{}{:08}", prefix as char, i).into_bytes();
+                let v = vec![b'v'; 248];
+                db.put_with_options(
+                    &k,
+                    &v,
+                    &PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // ----- Phase 1: first L0->L1 round -----
+        // Write enough to trigger the L0 compaction (~4 L0 SSTs).
+        for prefix in b'a'..=b'd' {
+            write_batch(&db, prefix, 16).await; // ~4 KiB per batch
+            flush_memtable(&db).await;
+        }
+
+        let s1 = wait_for_compacted_condition(&manifest_store, Duration::from_secs(30), |core| {
+            !core.tree.compacted.is_empty()
+        })
+        .await
+        .expect("phase 1 timed out: no SR appeared in `compacted` after first flushes");
+        assert_compacted_desc(&s1);
+        let l1_id_initial = s1.tree.compacted[0].id;
+        assert_eq!(
+            s1.tree.compacted.len(),
+            1,
+            "phase 1: expected single L1 SR, got {:?}",
+            s1.tree.compacted.iter().map(|sr| sr.id).collect::<Vec<_>>(),
+        );
+
+        // ----- Phase 2: L1 fold-in -----
+        // Two more L0 rounds, well under L1's 16 KiB target. After each, L1
+        // must still be the same SR id (fold-in works) and still alone.
+        for round in 0..2u32 {
+            for prefix in 0..4u8 {
+                write_batch(&db, b'e' + round as u8 * 4 + prefix, 8).await; // ~2 KiB
+                flush_memtable(&db).await;
+            }
+            let s =
+                wait_for_compacted_condition(&manifest_store, Duration::from_secs(30), |core| {
+                    core.tree.l0.is_empty() && !core.tree.compacted.is_empty()
+                })
+                .await
+                .unwrap_or_else(|| panic!("phase 2 round {round} timed out"));
+            assert_compacted_desc(&s);
+            assert_eq!(
+                s.tree.compacted[0].id, l1_id_initial,
+                "phase 2 round {round}: L1's SR id changed from {l1_id_initial} to {} (fold-in regression)",
+                s.tree.compacted[0].id,
+            );
+        }
+
+        // ----- Phase 3: overflow L1, observe L1 -> L2 cascade -----
+        // Keep writing until compacted.len() >= 2 or we exhaust budget.
+        let mut s_phase3: Option<ManifestCore> = None;
+        for round in 0..40u32 {
+            write_batch(&db, b'A' + (round % 26) as u8, 16).await;
+            flush_memtable(&db).await;
+            if let Some(s) =
+                wait_for_compacted_condition(&manifest_store, Duration::from_secs(3), |core| {
+                    core.tree.compacted.len() >= 2
+                })
+                .await
+            {
+                s_phase3 = Some(s);
+                break;
+            }
+        }
+        let s2 = s_phase3.expect(
+            "phase 3 timed out: cascade L1->L2 never produced a second SR (static-mapping bug?)",
+        );
+        assert_compacted_desc(&s2);
+        assert!(
+            s2.tree.compacted.len() >= 2,
+            "phase 3: expected >= 2 SRs, got {}",
+            s2.tree.compacted.len(),
+        );
+        // The new L2's id must be strictly less than the original L1 id
+        // (fresh_deeper_sr_id allocates below).
+        assert!(
+            s2.tree.compacted[1].id < l1_id_initial,
+            "phase 3: L2 id {} should be < initial L1 id {}",
+            s2.tree.compacted[1].id,
+            l1_id_initial,
+        );
+
+        db.close().await.unwrap();
+    }
+
     #[cfg(feature = "wal_disable")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_tombstones_in_l0() {
