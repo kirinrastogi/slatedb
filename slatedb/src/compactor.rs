@@ -1552,13 +1552,13 @@ mod tests {
             "phase 1: expected single L1 SR, got {:?}",
             s1.tree.compacted.iter().map(|sr| sr.id).collect::<Vec<_>>(),
         );
-        // Under `id = num_levels - 1 - level`, L1 (shallowest) for the
-        // test's num_levels=5 has sr_id 3. compacted descending puts L1 at
+        // Under `id = num_levels - level`, L1 (shallowest) for the
+        // test's num_levels=5 has sr_id 4. compacted descending puts L1 at
         // compacted[0] and deeper levels at smaller indices toward the end.
-        let l1_id_initial: u32 = 3;
+        let l1_id_initial: u32 = 4;
         assert_eq!(
             s1.tree.compacted[0].id, l1_id_initial,
-            "phase 1: L1 should have sr_id == {l1_id_initial} (= num_levels - 2), got {}",
+            "phase 1: L1 should have sr_id == {l1_id_initial} (= num_levels - 1), got {}",
             s1.tree.compacted[0].id,
         );
 
@@ -1586,7 +1586,7 @@ mod tests {
         }
 
         // ----- Phase 3: overflow L1, observe L1 -> L2 cascade -----
-        // Under id = num_levels - 1 - level, deeper levels have *smaller*
+        // Under id = num_levels - level, deeper levels have *smaller*
         // ids. compacted[0] is L1; deeper SRs follow with decreasing ids.
         let mut s_phase3: Option<ManifestCore> = None;
         for round in 0..40u32 {
@@ -1611,7 +1611,7 @@ mod tests {
             s2.tree.compacted.len(),
         );
         // L1 stays at compacted[0]; L2 appears at compacted[1] with a
-        // smaller id (= num_levels - 1 - 2).
+        // smaller id (= num_levels - 2).
         assert_eq!(
             s2.tree.compacted[0].id, l1_id_initial,
             "phase 3: L1 should still be SR({l1_id_initial}) at head",
