@@ -14,14 +14,21 @@ use crate::size_tiered_compaction::SizeTieredCompactionScheduler;
 
 /// Leveled compaction scheduler.
 ///
-/// Levels L0..L(num_levels-1). Each Ln (n>=1) is a single sorted run with id
-/// `num_levels - 1 - n`, so L1 has the highest SR id and the deepest level
-/// holds SR 0.
+/// Levels are assigned by *position* in the descending-id-ordered compacted
+/// list of sorted runs in the root tree: L1 is the newest (highest-id) SR,
+/// L2 the next-newest, and so on down to the deepest level. This decouples
+/// level membership from the sr_id values that the L0 path's underlying
+/// size-tiered allocator hands out (which grow upward as `max + 1` each
+/// round), so the cascade actually triggers on the right SRs.
 ///
 /// L0 -> L1 is delegated to a size-tiered scheduler so that L0 flushing is
-/// driven by file count thresholds, matching the existing behavior. Ln -> Ln+1
-/// (n >= 1) compactions are emitted as `LeveledCompactionSpec`s with
-/// `sr_sst_selections` listing the SST views to consume from each side
+/// driven by file count thresholds. We then rewrite each emitted L0-only
+/// spec to fold the existing L1 SR (if any) in as an additional source with
+/// destination = L1's id, so L1 grows as a single SR rather than fragmenting
+/// into a new SR every flush.
+///
+/// Ln -> Ln+1 (n >= 1) compactions are emitted as `LeveledCompactionSpec`s
+/// with `sr_sst_selections` listing the SST views to consume from each side
 /// (file-level / partial SR compaction).
 pub(crate) struct LeveledCompactionScheduler {
     options: LeveledCompactionSchedulerOptions,
@@ -44,29 +51,25 @@ impl LeveledCompactionScheduler {
         }
     }
 
-    /// Maps a logical level (1..num_levels) to a sorted run id.
-    fn sr_id_for_level(&self, level: usize) -> u32 {
-        assert!(
-            level >= 1 && level < self.options.num_levels,
-            "level {} out of range [1, {})",
-            level,
-            self.options.num_levels
-        );
-        (self.options.num_levels - 1 - level) as u32
+    /// Position-based: returns the SR at level `level` (1-indexed), if any.
+    /// `compacted` is kept in strictly descending id order, so L1 is index 0.
+    fn sr_at_level<'a>(&self, db_state: &'a ManifestCore, level: usize) -> Option<&'a SortedRun> {
+        if level < 1 || level >= self.options.num_levels {
+            return None;
+        }
+        db_state.tree.compacted.get(level - 1)
     }
 
-    /// Maps an SR id back to a logical level, or None if it doesn't fit.
-    fn level_for_sr_id(&self, sr_id: u32) -> Option<usize> {
-        let level = self
-            .options
-            .num_levels
-            .checked_sub(1)?
-            .checked_sub(sr_id as usize)?;
-        if (1..self.options.num_levels).contains(&level) {
-            Some(level)
-        } else {
-            None
-        }
+    /// Returns the (1-indexed) level of `sr_id` based on its position in the
+    /// descending-id compacted list, or `None` if the id isn't present.
+    fn level_of_sr_id(&self, db_state: &ManifestCore, sr_id: u32) -> Option<usize> {
+        db_state
+            .tree
+            .compacted
+            .iter()
+            .position(|sr| sr.id == sr_id)
+            .map(|pos| pos + 1)
+            .filter(|level| *level < self.options.num_levels)
     }
 
     fn level_target_size(&self, level: usize) -> u64 {
@@ -75,18 +78,33 @@ impl LeveledCompactionScheduler {
         (base * multiplier.powi((level - 1) as i32)) as u64
     }
 
-    fn find_sr_for_level<'a>(
-        &self,
-        db_state: &'a ManifestCore,
-        level: usize,
-    ) -> Option<&'a SortedRun> {
-        let sr_id = self.sr_id_for_level(level);
-        db_state.tree.compacted.iter().find(|sr| sr.id == sr_id)
+    fn level_size(&self, db_state: &ManifestCore, level: usize) -> u64 {
+        self.sr_at_level(db_state, level)
+            .map_or(0, |sr| sr.estimate_size())
     }
 
-    fn level_size(&self, db_state: &ManifestCore, level: usize) -> u64 {
-        self.find_sr_for_level(db_state, level)
-            .map_or(0, |sr| sr.estimate_size())
+    /// Picks a fresh SR id for a new deeper level (Ln+1 doesn't exist yet).
+    /// The id must be strictly less than `src_sr_id` to preserve the
+    /// descending-id ordering of `compacted`. We use `src_sr_id - 1` if that
+    /// id is free; otherwise step further down.
+    fn fresh_deeper_sr_id(
+        db_state: &ManifestCore,
+        active: &[&CompactionSpec],
+        src_sr_id: u32,
+    ) -> Option<u32> {
+        let mut taken: HashSet<u32> = db_state.tree.compacted.iter().map(|sr| sr.id).collect();
+        for spec in active {
+            if let Some(d) = spec.destination() {
+                taken.insert(d);
+            }
+        }
+        let mut candidate = src_sr_id.checked_sub(1)?;
+        loop {
+            if !taken.contains(&candidate) {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_sub(1)?;
+        }
     }
 
     fn is_sr_id_in_active_compaction(active: &[&CompactionSpec], sr_id: u32) -> bool {
@@ -108,49 +126,57 @@ impl LeveledCompactionScheduler {
         let mut best_level: Option<usize> = None;
         let mut best_score: f64 = 1.0;
 
-        for level in 1..=(self.options.num_levels - 2) {
+        // Only consider levels that actually have an SR as a source, and
+        // whose destination level is in range. Ln+1 either already exists in
+        // the compacted list or gets a fresh id allocated below the source.
+        let max_source_level = db_state
+            .tree
+            .compacted
+            .len()
+            .min(self.options.num_levels.saturating_sub(2));
+
+        for level in 1..=max_source_level {
             let target = self.level_target_size(level);
             if target == 0 {
                 continue;
             }
             let actual = self.level_size(db_state, level);
             let score = actual as f64 / target as f64;
-            if score >= 1.0 && score > best_score {
-                let src = self.sr_id_for_level(level);
-                let dst = self.sr_id_for_level(level + 1);
-                if !Self::is_sr_id_in_active_compaction(active, src)
-                    && !Self::is_sr_id_in_active_compaction(active, dst)
-                {
-                    best_score = score;
-                    best_level = Some(level);
-                }
-            } else if (score - 1.0).abs() < f64::EPSILON && best_level.is_none() {
-                // edge case: score == 1.0 exactly and no better candidate yet
-                let src = self.sr_id_for_level(level);
-                let dst = self.sr_id_for_level(level + 1);
-                if !Self::is_sr_id_in_active_compaction(active, src)
-                    && !Self::is_sr_id_in_active_compaction(active, dst)
-                {
-                    best_score = score;
-                    best_level = Some(level);
-                }
+            let qualifies =
+                score > best_score || ((score - 1.0).abs() < f64::EPSILON && best_level.is_none());
+            if !qualifies {
+                continue;
             }
+            let Some(src_sr) = self.sr_at_level(db_state, level) else {
+                continue;
+            };
+            let src = src_sr.id;
+            let dst_existing = self.sr_at_level(db_state, level + 1).map(|sr| sr.id);
+            let dst_busy = dst_existing
+                .map(|id| Self::is_sr_id_in_active_compaction(active, id))
+                .unwrap_or(false);
+            if Self::is_sr_id_in_active_compaction(active, src) || dst_busy {
+                continue;
+            }
+            best_score = score;
+            best_level = Some(level);
         }
 
-        best_level.map(|level| self.build_level_compaction(db_state, level))
+        best_level.and_then(|level| self.build_level_compaction(db_state, active, level))
     }
 
     /// Builds a file-level CompactionSpec for Ln -> Ln+1.
     ///
     /// Picks the first SST from the source SR (smallest key range), finds
     /// overlapping SSTs in the destination SR, and emits a partial-SR spec.
-    fn build_level_compaction(&self, db_state: &ManifestCore, level: usize) -> CompactionSpec {
-        let src_sr_id = self.sr_id_for_level(level);
-        let dst_sr_id = self.sr_id_for_level(level + 1);
-
-        let src_sr = self
-            .find_sr_for_level(db_state, level)
-            .expect("source level SR must exist");
+    fn build_level_compaction(
+        &self,
+        db_state: &ManifestCore,
+        active: &[&CompactionSpec],
+        level: usize,
+    ) -> Option<CompactionSpec> {
+        let src_sr = self.sr_at_level(db_state, level)?;
+        let src_sr_id = src_sr.id;
         let picked = &src_sr.sst_views[0];
 
         let mut sources = vec![SourceId::SortedRun(src_sr_id)];
@@ -159,20 +185,24 @@ impl LeveledCompactionScheduler {
             view_ids: vec![picked.id],
         }];
 
-        if let Some(dst_sr) = self.find_sr_for_level(db_state, level + 1) {
+        let dst_sr_id = if let Some(dst_sr) = self.sr_at_level(db_state, level + 1) {
             let start_key = picked.compacted_effective_start_key();
             let end_key = picked.sst.info.last_entry.as_ref().unwrap_or(start_key);
             let overlapping = Self::find_overlapping_sst_ids(dst_sr, start_key, end_key);
             if !overlapping.is_empty() {
-                sources.push(SourceId::SortedRun(dst_sr_id));
+                sources.push(SourceId::SortedRun(dst_sr.id));
                 selections.push(SortedRunSstSelection {
-                    sr_id: dst_sr_id,
+                    sr_id: dst_sr.id,
                     view_ids: overlapping,
                 });
             }
-        }
+            dst_sr.id
+        } else {
+            // Ln+1 doesn't exist yet — allocate a fresh id below src.
+            Self::fresh_deeper_sr_id(db_state, active, src_sr_id)?
+        };
 
-        CompactionSpec::leveled(sources, dst_sr_id, selections)
+        Some(CompactionSpec::leveled(sources, dst_sr_id, selections))
     }
 
     fn find_overlapping_sst_ids(
@@ -186,30 +216,78 @@ impl LeveledCompactionScheduler {
             .map(|view| view.id)
             .collect()
     }
+
+    /// True if every source in `spec` is an L0 SST view (no SR sources).
+    fn is_pure_l0_spec(spec: &CompactionSpec) -> bool {
+        !spec.sources().is_empty()
+            && spec
+                .sources()
+                .iter()
+                .all(|s| matches!(s, SourceId::SstView(_)))
+    }
+
+    /// Rewrites a pure-L0 spec produced by the size-tiered delegate so that
+    /// the existing L1 SR (if any, in the root tree, and not in active
+    /// compaction) is folded in as an additional source and the destination
+    /// is L1's id. This keeps L1 as a single growing SR instead of
+    /// fragmenting into a new SR each flush.
+    fn fold_l1_into_l0_spec(
+        &self,
+        db_state: &ManifestCore,
+        active: &[&CompactionSpec],
+        spec: CompactionSpec,
+    ) -> CompactionSpec {
+        if !spec.segment().is_empty() {
+            return spec;
+        }
+        let Some(l1) = self.sr_at_level(db_state, 1) else {
+            return spec;
+        };
+        if Self::is_sr_id_in_active_compaction(active, l1.id) {
+            return spec;
+        }
+        let mut sources = spec.sources().to_vec();
+        sources.push(SourceId::SortedRun(l1.id));
+        CompactionSpec::for_segment(spec.segment().clone(), sources, l1.id)
+    }
 }
 
 impl CompactionScheduler for LeveledCompactionScheduler {
     fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
-        // L0 -> L1: delegate to size-tiered. Filter to specs that include L0
-        // SSTs only; the size-tiered scheduler may also propose SR-only specs,
-        // but Ln -> Ln+1 selection is owned by us.
-        let mut compactions: Vec<CompactionSpec> = self
+        let db_state = state.manifest().core();
+
+        // L0 -> L1: delegate to size-tiered. Accept only specs whose sources
+        // are entirely L0 SST views (size-tiered may also propose SR-only
+        // specs, but Ln -> Ln+1 selection is owned by us).
+        let l0_specs: Vec<CompactionSpec> = self
             .l0_scheduler
             .propose(state)
             .into_iter()
-            .filter(|spec| spec.has_l0_sources())
+            .filter(Self::is_pure_l0_spec)
             .collect();
 
-        let active: Vec<&CompactionSpec> = state
+        let pre_active: Vec<&CompactionSpec> = state
             .compactions()
             .into_iter()
             .flat_map(|c| c.core().recent_compactions())
             .filter(|c| c.active())
             .map(|c| c.spec())
+            .collect();
+
+        // Fold the existing L1 SR into each L0 spec so L1 grows as a single
+        // SR instead of fragmenting.
+        let mut compactions: Vec<CompactionSpec> = l0_specs
+            .into_iter()
+            .map(|spec| self.fold_l1_into_l0_spec(db_state, &pre_active, spec))
+            .collect();
+
+        let active: Vec<&CompactionSpec> = pre_active
+            .iter()
+            .copied()
             .chain(compactions.iter())
             .collect();
 
-        if let Some(spec) = self.pick_level_compaction(state.manifest().core(), &active) {
+        if let Some(spec) = self.pick_level_compaction(db_state, &active) {
             compactions.push(spec);
         }
 
@@ -241,7 +319,7 @@ impl CompactionScheduler for LeveledCompactionScheduler {
             ));
         }
 
-        let source_level = match self.level_for_sr_id(unique_sr_ids[0]) {
+        let source_level = match self.level_of_sr_id(db_state, unique_sr_ids[0]) {
             Some(l) => l,
             None => {
                 return Err(Error::invalid(
@@ -255,14 +333,23 @@ impl CompactionScheduler for LeveledCompactionScheduler {
             return Err(Error::invalid("source level has no next level".to_string()));
         }
 
-        let expected_dest = self.sr_id_for_level(dest_level);
-        if spec.destination() != Some(expected_dest) {
-            return Err(Error::invalid(
-                "destination does not match expected next level".to_string(),
-            ));
+        // Destination must either be the existing SR at dest_level, or — if
+        // dest_level has no SR — any id strictly less than the source SR id
+        // (preserves descending-id ordering of `compacted`).
+        let expected_dest = self.sr_at_level(db_state, dest_level).map(|sr| sr.id);
+        match (expected_dest, spec.destination()) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, Some(actual)) if actual < unique_sr_ids[0] => {}
+            _ => {
+                return Err(Error::invalid(
+                    "destination does not match expected next level".to_string(),
+                ));
+            }
         }
 
-        if unique_sr_ids.len() == 2 && self.level_for_sr_id(unique_sr_ids[1]) != Some(dest_level) {
+        if unique_sr_ids.len() == 2
+            && self.level_of_sr_id(db_state, unique_sr_ids[1]) != Some(dest_level)
+        {
             return Err(Error::invalid(
                 "second SR source must be the destination level".to_string(),
             ));
@@ -547,16 +634,72 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_non_adjacent_levels() {
+        // compacted = [SR(5), SR(4), SR(3)] -> position-based L1, L2, L3.
+        // A spec that names SR(5) as source but targets SR(3) skips L2 and
+        // is invalid (must compact into the immediate next level).
         let scheduler = default_scheduler();
         let l1 = create_sr(5, 300, 2);
-        let l3 = create_sr(3, 1000, 4);
-        let state = create_compactor_state(create_db_state(VecDeque::new(), vec![l1, l3]));
-        let spec = CompactionSpec::leveled(
-            vec![SourceId::SortedRun(5), SourceId::SortedRun(3)],
-            3,
-            vec![],
-        );
+        let l2 = create_sr(4, 1000, 4);
+        let l3 = create_sr(3, 5000, 4);
+        let state = create_compactor_state(create_db_state(VecDeque::new(), vec![l1, l2, l3]));
+        let spec = CompactionSpec::leveled(vec![SourceId::SortedRun(5)], 3, vec![]);
         assert!(scheduler.validate(&(&state).into(), &spec).is_err());
+    }
+
+    #[test]
+    fn test_l0_to_l1_folds_existing_l1_into_spec() {
+        // When L1 exists and is not in active compaction, an L0->L1 spec
+        // should fold the L1 SR in as a source and target L1's existing id
+        // (so L1 grows as a single SR rather than fragmenting).
+        let scheduler = default_scheduler();
+        let l0: VecDeque<_> = (0..4).map(|_| create_sst_view(1)).collect();
+        let l1 = create_sr(5, 100, 2);
+        let l1_id = l1.id;
+        let state = create_compactor_state(create_db_state(l0, vec![l1]));
+
+        let specs = scheduler.propose(&(&state).into());
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert!(spec.has_l0_sources());
+        assert!(spec.has_sr_sources());
+        assert_eq!(spec.destination(), Some(l1_id));
+        let sr_sources: Vec<_> = spec
+            .sources()
+            .iter()
+            .filter_map(|s| s.maybe_unwrap_sorted_run())
+            .collect();
+        assert_eq!(sr_sources, vec![l1_id]);
+    }
+
+    #[test]
+    fn test_l0_to_l1_skips_fold_when_l1_busy() {
+        // If L1 is currently a source/destination of an active compaction,
+        // the L0 spec must NOT fold it in (else two compactions would race).
+        let scheduler = default_scheduler();
+        let l0: VecDeque<_> = (0..4).map(|_| create_sst_view(1)).collect();
+        let l1 = create_sr_with_ranges(5, 200, 2);
+        let l2 = create_sr_with_ranges(4, 100, 2);
+        let mut state = create_compactor_state(create_db_state(l0, vec![l1, l2]));
+
+        let rand = Arc::new(DbRand::default());
+        let clock = Arc::new(DefaultSystemClock::new());
+        let id = rand.rng().gen_ulid(clock.as_ref());
+        // Pretend an L1->L2 compaction is already running.
+        let running = CompactionSpec::leveled(
+            vec![SourceId::SortedRun(5), SourceId::SortedRun(4)],
+            4,
+            vec![SortedRunSstSelection {
+                sr_id: 5,
+                view_ids: vec![],
+            }],
+        );
+        state.add_compaction(Compaction::new(id, running)).unwrap();
+
+        let specs = scheduler.propose(&(&state).into());
+        // The L0 spec is still emitted, but no fold-in since L1 is busy.
+        let l0_specs: Vec<_> = specs.iter().filter(|s| s.has_l0_sources()).collect();
+        assert_eq!(l0_specs.len(), 1);
+        assert!(!l0_specs[0].has_sr_sources());
     }
 
     #[test]
