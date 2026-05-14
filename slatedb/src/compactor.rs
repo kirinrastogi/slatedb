@@ -1526,17 +1526,23 @@ mod tests {
         .await
         .expect("phase 1 timed out: no SR appeared in `compacted` after first flushes");
         assert_compacted_desc(&s1);
-        let l1_id_initial = s1.tree.compacted[0].id;
         assert_eq!(
             s1.tree.compacted.len(),
             1,
             "phase 1: expected single L1 SR, got {:?}",
             s1.tree.compacted.iter().map(|sr| sr.id).collect::<Vec<_>>(),
         );
+        // Under level == sr_id, L1 is SR(1).
+        let l1_id_initial: u32 = 1;
+        assert_eq!(
+            s1.tree.compacted[0].id, l1_id_initial,
+            "phase 1: L1 should have sr_id == 1 under level == id mapping, got {}",
+            s1.tree.compacted[0].id,
+        );
 
         // ----- Phase 2: L1 fold-in -----
         // Two more L0 rounds, well under L1's 16 KiB target. After each, L1
-        // must still be the same SR id (fold-in works) and still alone.
+        // (compacted.last(), smallest id) must still be SR(1).
         for round in 0..2u32 {
             for prefix in 0..4u8 {
                 write_batch(&db, b'e' + round as u8 * 4 + prefix, 8).await; // ~2 KiB
@@ -1549,15 +1555,17 @@ mod tests {
                 .await
                 .unwrap_or_else(|| panic!("phase 2 round {round} timed out"));
             assert_compacted_desc(&s);
+            let l1_now = s.tree.compacted.last().expect("phase 2: compacted empty");
             assert_eq!(
-                s.tree.compacted[0].id, l1_id_initial,
+                l1_now.id, l1_id_initial,
                 "phase 2 round {round}: L1's SR id changed from {l1_id_initial} to {} (fold-in regression)",
-                s.tree.compacted[0].id,
+                l1_now.id,
             );
         }
 
         // ----- Phase 3: overflow L1, observe L1 -> L2 cascade -----
-        // Keep writing until compacted.len() >= 2 or we exhaust budget.
+        // With descending-id ordering and level == sr_id, compacted[0] is
+        // the deepest level (highest id) and compacted.last() is L1.
         let mut s_phase3: Option<ManifestCore> = None;
         for round in 0..40u32 {
             write_batch(&db, b'A' + (round % 26) as u8, 16).await;
@@ -1581,13 +1589,18 @@ mod tests {
             "phase 3: expected >= 2 SRs, got {}",
             s2.tree.compacted.len(),
         );
-        // The new L2's id must be strictly less than the original L1 id
-        // (fresh_deeper_sr_id allocates below).
+        // L2 (compacted[0], deepest) must have id > L1.
         assert!(
-            s2.tree.compacted[1].id < l1_id_initial,
-            "phase 3: L2 id {} should be < initial L1 id {}",
-            s2.tree.compacted[1].id,
+            s2.tree.compacted[0].id > l1_id_initial,
+            "phase 3: deepest SR id {} should be > L1 id {}",
+            s2.tree.compacted[0].id,
             l1_id_initial,
+        );
+        // L1 must still be present at the tail.
+        assert_eq!(
+            s2.tree.compacted.last().unwrap().id,
+            l1_id_initial,
+            "phase 3: L1 should still be SR({l1_id_initial}) at tail",
         );
 
         // ----- Phase 4: deeper levels exceed shallower in size -----
@@ -1596,16 +1609,17 @@ mod tests {
         // round that races an in-flight cascade would land in a fresh
         // max+1 SR, and all SRs would top out near L1's target. With the
         // fix, the single L1 stays put and L2 keeps absorbing cascaded
-        // SSTs, so L2 should eventually grow strictly larger than L1.
+        // SSTs, so the deepest SR should eventually grow strictly larger
+        // than L1.
         let mut s_phase4: Option<ManifestCore> = None;
         for round in 0..40u32 {
             write_batch(&db, b'a' + (round % 26) as u8, 32).await;
             flush_memtable(&db).await;
             if let Some(s) =
                 wait_for_compacted_condition(&manifest_store, Duration::from_secs(2), |core| {
-                    core.tree.compacted.len() >= 2
-                        && core.tree.compacted[1].estimate_size()
-                            > core.tree.compacted[0].estimate_size()
+                    let compacted = &core.tree.compacted;
+                    compacted.len() >= 2
+                        && compacted[0].estimate_size() > compacted.last().unwrap().estimate_size()
                 })
                 .await
             {
@@ -1618,11 +1632,11 @@ mod tests {
              levels would all be ~L1's target size instead of growing 10x)",
         );
         assert_compacted_desc(&s3);
-        let l1_size = s3.tree.compacted[0].estimate_size();
-        let l2_size = s3.tree.compacted[1].estimate_size();
+        let l1_size = s3.tree.compacted.last().unwrap().estimate_size();
+        let l2_size = s3.tree.compacted[0].estimate_size();
         assert!(
             l2_size > l1_size,
-            "phase 4: L2 should exceed L1, got L1={l1_size} L2={l2_size} ids={:?}",
+            "phase 4: deeper level should exceed L1, got L1={l1_size} L2={l2_size} ids={:?}",
             s3.tree.compacted.iter().map(|sr| sr.id).collect::<Vec<_>>(),
         );
 
