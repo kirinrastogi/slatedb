@@ -149,6 +149,29 @@ pub trait CompactionScheduler: Send + Sync {
         Ok(())
     }
 
+    /// Reports whether `spec` writes to the deepest level managed by this
+    /// scheduler. The compactor passes this through to `RetentionIterator`
+    /// as `filter_tombstone` — when true, the iterator strips tail
+    /// tombstones (so deleted/expired entries actually leave the store);
+    /// when false, tombstones are preserved so they can keep shadowing
+    /// older versions on their way down.
+    ///
+    /// The default implementation matches the legacy in-line check used by
+    /// size-tiered: the destination is the deepest level if it equals
+    /// `compacted.last()` in the target tree (or if `compacted` is empty,
+    /// meaning the new SR is the only one). Schedulers whose ordering
+    /// invariant differs — e.g. the leveled scheduler, where the deepest
+    /// level has the highest sr_id, not the lowest — must override.
+    fn is_dest_last_level(&self, state: &CompactorStateView, spec: &CompactionSpec) -> bool {
+        let Some(dest) = spec.destination() else {
+            return false;
+        };
+        let Some(tree) = state.manifest().core().tree_for_segment(spec.segment()) else {
+            return false;
+        };
+        tree.compacted.is_empty() || tree.compacted.last().is_some_and(|sr| sr.id == dest)
+    }
+
     /// Generate a compaction based on a compaction request.
     ///
     /// - If the request is a `CompactionRequest::Spec`, it simply returns the provided spec.
@@ -1045,17 +1068,14 @@ impl CompactorEventHandler {
         let destination = spec
             .destination()
             .expect("start_compaction reached with a drain spec — should have been intercepted");
-        // If there are no SRs in the target tree when we compact L0 then the
-        // resulting SR is the last sorted run. The check is scoped to the
-        // spec's target tree (RFC-0024); if the target segment is missing
-        // from the manifest, fall back to false — the commit path will no-op.
-        let is_dest_last_run = match db_state.tree_for_segment(spec.segment()) {
-            Some(tree) => {
-                tree.compacted.is_empty()
-                    || tree.compacted.last().is_some_and(|sr| destination == sr.id)
-            }
-            None => false,
-        };
+        // Delegate the "is this the deepest level?" decision to the
+        // scheduler — it owns the level ordering convention. The default
+        // impl reproduces the legacy size-tiered heuristic; the leveled
+        // scheduler overrides it because under `level == sr_id` the
+        // deepest level is the *highest* id, not the lowest.
+        let is_dest_last_run = self
+            .scheduler
+            .is_dest_last_level(&self.state().into(), spec);
 
         let job_args = StartCompactionJobArgs {
             id: job_id,

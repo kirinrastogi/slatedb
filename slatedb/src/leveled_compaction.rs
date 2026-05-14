@@ -278,6 +278,15 @@ impl LeveledCompactionScheduler {
 }
 
 impl CompactionScheduler for LeveledCompactionScheduler {
+    /// Returns true only when the compaction writes to the deepest level
+    /// configured for this scheduler. Under `level == sr_id`, that is
+    /// `dest == num_levels - 1`. The default trait impl (which checks
+    /// `compacted.last()`) would be *inverted* for leveled because
+    /// `compacted` is descending by id and `last()` is L1, not L_max.
+    fn is_dest_last_level(&self, _state: &CompactorStateView, spec: &CompactionSpec) -> bool {
+        spec.destination() == Some((self.options.num_levels - 1) as u32)
+    }
+
     fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
         let db_state = state.manifest().core();
 
@@ -810,6 +819,31 @@ mod tests {
         let state = create_compactor_state(create_db_state(l0, vec![]));
         let specs = scheduler.propose(&(&state).into());
         assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn test_is_dest_last_level() {
+        // num_levels = 7 => deepest level id is 6.
+        let scheduler = default_scheduler();
+        let state = create_compactor_state(create_db_state(VecDeque::new(), vec![]));
+        let view: CompactorStateView = (&state).into();
+
+        // Cascade specs at various depths.
+        let l1_to_l2 = CompactionSpec::leveled(vec![SourceId::SortedRun(1)], 2, vec![]);
+        let l5_to_l6 = CompactionSpec::leveled(vec![SourceId::SortedRun(5)], 6, vec![]);
+        // L0 fold-in into L1.
+        let l0_to_l1 = CompactionSpec::for_segment(
+            bytes::Bytes::new(),
+            vec![SourceId::SstView(ulid::Ulid::new()), SourceId::SortedRun(1)],
+            1,
+        );
+        // Drain spec — no destination.
+        let drain = CompactionSpec::drain_segment(bytes::Bytes::from_static(b"foo/"), Vec::new());
+
+        assert!(!scheduler.is_dest_last_level(&view, &l1_to_l2));
+        assert!(scheduler.is_dest_last_level(&view, &l5_to_l6));
+        assert!(!scheduler.is_dest_last_level(&view, &l0_to_l1));
+        assert!(!scheduler.is_dest_last_level(&view, &drain));
     }
 
     #[test]
