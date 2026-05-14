@@ -7,7 +7,7 @@ use crate::compactor::{CompactionScheduler, CompactionSchedulerSupplier};
 use crate::compactor_state::{CompactionSpec, SortedRunSstSelection, SourceId};
 use crate::compactor_state_protocols::CompactorStateView;
 use crate::config::{CompactorOptions, LeveledCompactionSchedulerOptions};
-use crate::db_state::SortedRun;
+use crate::db_state::{SortedRun, SsTableView};
 use crate::error::Error;
 use crate::manifest::ManifestCore;
 use crate::size_tiered_compaction::SizeTieredCompactionScheduler;
@@ -167,8 +167,14 @@ impl LeveledCompactionScheduler {
 
     /// Builds a file-level CompactionSpec for Ln -> Ln+1.
     ///
-    /// Picks the first SST from the source SR (smallest key range), finds
-    /// overlapping SSTs in the destination SR, and emits a partial-SR spec.
+    /// Picks enough consecutive SSTs from the source SR (starting at the
+    /// smallest key) to bring Ln back at or below its target after the
+    /// cascade, finds overlapping SSTs in the destination SR, and emits a
+    /// partial-SR spec. Picking only one SST per cascade would limit each
+    /// propose() call to moving at most `max_sst_size` bytes downward,
+    /// which makes the cascade saturate slowly and prevents deeper levels
+    /// from accumulating to their (much larger) targets in any reasonable
+    /// time.
     fn build_level_compaction(
         &self,
         db_state: &ManifestCore,
@@ -177,8 +183,22 @@ impl LeveledCompactionScheduler {
     ) -> Option<CompactionSpec> {
         let src_sr = self.sr_at_level(db_state, level)?;
         let src_sr_id = src_sr.id;
-        let picked = &src_sr.sst_views[0];
         let dst_existing = self.sr_at_level(db_state, level + 1);
+
+        // Pick enough SSTs to remove (src_total - target) bytes, capped to
+        // the source's SSTs. Take at least one.
+        let target = self.level_target_size(level);
+        let src_total = src_sr.estimate_size();
+        let to_remove = src_total.saturating_sub(target);
+        let mut picked_size: u64 = 0;
+        let mut picked_view_ids: Vec<ulid::Ulid> = Vec::new();
+        for view in &src_sr.sst_views {
+            if picked_size >= to_remove && !picked_view_ids.is_empty() {
+                break;
+            }
+            picked_view_ids.push(view.id);
+            picked_size += view.estimate_size();
+        }
 
         // Skip no-op cascades: if the source has only one SST view AND there
         // is no destination SR yet, the "cascade" would just rename the SR
@@ -187,19 +207,32 @@ impl LeveledCompactionScheduler {
         // the renamed SR becomes the new L1 — and would cycle indefinitely
         // until sr_id hits 0. Wait for more data to accumulate so the
         // source has at least 2 SSTs and the cascade actually splits it.
-        if dst_existing.is_none() && src_sr.sst_views.len() <= 1 {
+        if dst_existing.is_none() && picked_view_ids.len() == src_sr.sst_views.len() {
             return None;
         }
 
         let mut sources = vec![SourceId::SortedRun(src_sr_id)];
         let mut selections = vec![SortedRunSstSelection {
             sr_id: src_sr_id,
-            view_ids: vec![picked.id],
+            view_ids: picked_view_ids.clone(),
         }];
 
         let dst_sr_id = if let Some(dst_sr) = dst_existing {
-            let start_key = picked.compacted_effective_start_key();
-            let end_key = picked.sst.info.last_entry.as_ref().unwrap_or(start_key);
+            // Find the key range spanned by all picked SSTs.
+            let picked_set: HashSet<ulid::Ulid> = picked_view_ids.iter().copied().collect();
+            let picked_views: Vec<&SsTableView> = src_sr
+                .sst_views
+                .iter()
+                .filter(|v| picked_set.contains(&v.id))
+                .collect();
+            let start_key = picked_views.first()?.compacted_effective_start_key();
+            let last_picked = picked_views.last()?;
+            let end_key = last_picked
+                .sst
+                .info
+                .last_entry
+                .as_ref()
+                .unwrap_or(start_key);
             let overlapping = Self::find_overlapping_sst_ids(dst_sr, start_key, end_key);
             if !overlapping.is_empty() {
                 sources.push(SourceId::SortedRun(dst_sr.id));
@@ -249,28 +282,45 @@ impl LeveledCompactionScheduler {
     /// headroom below L1. The size-tiered delegate would otherwise hand us
     /// `0` as the first destination, making `fresh_deeper_sr_id` unable to
     /// allocate L2's id (since L2 needs an id strictly less than L1's).
+    ///
+    /// Returns `None` when L1 exists but is busy in an active compaction
+    /// (typically an L1 -> L2 cascade). Emitting the size-tiered spec
+    /// unchanged in that case would route the new data to a fresh max+1
+    /// id, creating a "shadow L1" with smaller data that demotes the real
+    /// L1 to L2 in the position-based level mapping. Every shadow caps
+    /// out at ~L1's target before cascading, so all the data ends up
+    /// distributed across many same-sized SRs instead of growing 10x per
+    /// level. Waiting for the cascade to finish keeps a single L1.
     fn fold_l1_into_l0_spec(
         &self,
         db_state: &ManifestCore,
         active: &[&CompactionSpec],
         spec: CompactionSpec,
-    ) -> CompactionSpec {
+    ) -> Option<CompactionSpec> {
         if !spec.segment().is_empty() {
-            return spec;
+            return Some(spec);
         }
         if let Some(l1) = self.sr_at_level(db_state, 1) {
             if Self::is_sr_id_in_active_compaction(active, l1.id) {
-                return spec;
+                return None;
             }
             let mut sources = spec.sources().to_vec();
             sources.push(SourceId::SortedRun(l1.id));
-            return CompactionSpec::for_segment(spec.segment().clone(), sources, l1.id);
+            return Some(CompactionSpec::for_segment(
+                spec.segment().clone(),
+                sources,
+                l1.id,
+            ));
         }
 
         // Bootstrap: no L1 exists. Replace the size-tiered destination with
         // an id that leaves room for `num_levels - 1` cascades below it.
         let dest = self.bootstrap_l1_dest(db_state, active, spec.destination());
-        CompactionSpec::for_segment(spec.segment().clone(), spec.sources().to_vec(), dest)
+        Some(CompactionSpec::for_segment(
+            spec.segment().clone(),
+            spec.sources().to_vec(),
+            dest,
+        ))
     }
 
     /// Picks the destination id for the first L0 -> L1 round (no L1 exists
@@ -332,13 +382,14 @@ impl CompactionScheduler for LeveledCompactionScheduler {
             pre_active.iter().copied().chain(cascade.iter()).collect();
 
         // Fold the existing L1 SR into each L0 spec so L1 grows as a single
-        // SR. Skipped automatically when L1 is busy (e.g. just-picked L1->L2
-        // cascade), in which case the L0 spec keeps its size-tiered fresh
-        // destination id and a new transient SR appears; that SR becomes the
-        // new L1 once the old L1's cascade completes.
+        // SR. Dropped entirely when L1 is busy (e.g. just-picked L1->L2
+        // cascade): emitting the size-tiered fall-through spec would land
+        // the new data in a fresh max+1 SR id, creating a "shadow L1" that
+        // demotes the real L1 to L2 under position-based mapping and
+        // prevents deeper levels from growing 10x.
         let l0_compactions: Vec<CompactionSpec> = l0_specs
             .into_iter()
-            .map(|spec| self.fold_l1_into_l0_spec(db_state, &active_after_cascade, spec))
+            .filter_map(|spec| self.fold_l1_into_l0_spec(db_state, &active_after_cascade, spec))
             .collect();
 
         let mut compactions = Vec::new();
@@ -725,9 +776,11 @@ mod tests {
     }
 
     #[test]
-    fn test_l0_to_l1_skips_fold_when_l1_busy() {
+    fn test_l0_to_l1_drops_spec_when_l1_busy() {
         // If L1 is currently a source/destination of an active compaction,
-        // the L0 spec must NOT fold it in (else two compactions would race).
+        // the L0 fold-in must be dropped entirely. Emitting a fall-through
+        // spec with size-tiered's max+1 dest would create a "shadow L1"
+        // SR that demotes the real L1 to L2 under position-based mapping.
         let scheduler = default_scheduler();
         let l0: VecDeque<_> = (0..4).map(|_| create_sst_view(1)).collect();
         let l1 = create_sr_with_ranges(5, 200, 2);
@@ -749,10 +802,12 @@ mod tests {
         state.add_compaction(Compaction::new(id, running)).unwrap();
 
         let specs = scheduler.propose(&(&state).into());
-        // The L0 spec is still emitted, but no fold-in since L1 is busy.
         let l0_specs: Vec<_> = specs.iter().filter(|s| s.has_l0_sources()).collect();
-        assert_eq!(l0_specs.len(), 1);
-        assert!(!l0_specs[0].has_sr_sources());
+        assert!(
+            l0_specs.is_empty(),
+            "expected no L0 spec while L1 is busy, got {:?}",
+            l0_specs.iter().map(|s| s.destination()).collect::<Vec<_>>(),
+        );
     }
 
     #[test]

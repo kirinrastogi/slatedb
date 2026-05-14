@@ -1590,6 +1590,42 @@ mod tests {
             l1_id_initial,
         );
 
+        // ----- Phase 4: deeper levels exceed shallower in size -----
+        // After Phase 3 fired the first L1->L2, L2's size depends on how
+        // many cascades have run. Under the "shadow L1" bug, every L0->L1
+        // round that races an in-flight cascade would land in a fresh
+        // max+1 SR, and all SRs would top out near L1's target. With the
+        // fix, the single L1 stays put and L2 keeps absorbing cascaded
+        // SSTs, so L2 should eventually grow strictly larger than L1.
+        let mut s_phase4: Option<ManifestCore> = None;
+        for round in 0..40u32 {
+            write_batch(&db, b'a' + (round % 26) as u8, 32).await;
+            flush_memtable(&db).await;
+            if let Some(s) =
+                wait_for_compacted_condition(&manifest_store, Duration::from_secs(2), |core| {
+                    core.tree.compacted.len() >= 2
+                        && core.tree.compacted[1].estimate_size()
+                            > core.tree.compacted[0].estimate_size()
+                })
+                .await
+            {
+                s_phase4 = Some(s);
+                break;
+            }
+        }
+        let s3 = s_phase4.expect(
+            "phase 4 timed out: L2 never grew larger than L1 (shadow-L1 bug? \
+             levels would all be ~L1's target size instead of growing 10x)",
+        );
+        assert_compacted_desc(&s3);
+        let l1_size = s3.tree.compacted[0].estimate_size();
+        let l2_size = s3.tree.compacted[1].estimate_size();
+        assert!(
+            l2_size > l1_size,
+            "phase 4: L2 should exceed L1, got L1={l1_size} L2={l2_size} ids={:?}",
+            s3.tree.compacted.iter().map(|sr| sr.id).collect::<Vec<_>>(),
+        );
+
         db.close().await.unwrap();
     }
 
