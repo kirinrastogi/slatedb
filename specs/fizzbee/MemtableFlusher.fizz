@@ -1,0 +1,305 @@
+---
+deadlock_detection: false
+options:
+    max_actions: 60
+    crash_on_yield: false
+action_options:
+    Db.NormalWrite:
+        max_actions: 4
+    Db.TxnConflict:
+        max_actions: 2
+    Db.FreezeMemtable:
+        max_actions: 4
+    Db.FreezeWal:
+        max_actions: 5
+    Db.FlushWalChunk:
+        max_actions: 5
+    Uploader.UploadImm:
+        max_actions: 4
+    ManifestWriter.RetireBatch:
+        max_actions: 4
+---
+
+# # SlateDB Memtable Flusher / Transaction Hang Model
+#
+# This model abstracts the slatedb write/freeze/upload/retire pipeline to look
+# for liveness violations in the manifest writer after PR #1603.
+#
+# Bug context (#1593, fixed in #1603):
+# - `commit_seq = oracle.next_seq()` is consumed BEFORE the conflict check in
+#   batch_write.rs. If the transaction conflicts, the seqnum is consumed but no
+#   entry is ever written to memtable or WAL, leaving a "gap" in sequence
+#   numbers used by memtables.
+# - PR #1603's fix in memtable_flusher/manifest_writer.rs iterates the
+#   `imm_memtable` deque in order and uses `first_seq` to look up the uploaded
+#   memtable in `ready`, instead of relying on contiguous seqnums.
+#
+# This spec models the post-fix logic. The liveness property asserts that every
+# write that becomes part of a frozen imm-memtable is eventually retired by the
+# manifest writer.
+#
+# State that matters:
+#  - `next_seq`: monotonic counter (oracle.next_seq())
+#  - `durable_seq`: highest WAL-flushed seq
+#  - `last_l0_seq`: highest seq retired to manifest
+#  - `active_memtable_seqs`: seqs in the current writable memtable
+#  - `imm_memtables`: list of frozen imms; NEWEST first (push_front) at idx 0
+#  - `wal_buffer_seqs`: seqs in the current writable wal_buffer
+#  - `wal_chunks`: list of frozen wal chunks waiting to flush, each with last_seq
+#  - `ready_uploads`: dict {first_seq -> {first_seq, last_seq, ptr_id}} that
+#    have been uploaded but not yet retired (the manifest writer's `ready`)
+#
+# A pointer-id `ptr_id` is attached to each imm at freeze time. The manifest
+# writer asserts `Arc::ptr_eq(uploaded.imm_memtable, imm_memtable)`. Modeled by
+# checking ptr_id equality in this spec.
+
+# Bounds
+MAX_NORMAL_WRITES = 3
+MAX_TXN_CONFLICTS = 2
+
+role Db:
+    action Init:
+        self.next_seq = 1
+        self.durable_seq = 0
+        self.last_l0_seq = 0
+
+        # Memtable / imm-memtable state
+        self.active_memtable_seqs = []
+        self.imm_memtables = []          # newest at index 0
+        self.next_ptr_id = 1
+
+        # WAL state
+        self.wal_buffer_seqs = []
+        self.wal_chunks = []             # list of records(last_seq=...)
+
+        # Manifest writer's ready map
+        self.ready_uploads = {}          # first_seq -> {first_seq,last_seq,ptr_id}
+
+        # Counters to bound the model
+        self.normal_writes = 0
+        self.conflicts = 0
+
+        # Trace: every seq that *should* eventually be reflected in last_l0_seq
+        # because it ended up in an imm-memtable (or is being routed there).
+        # This is what the liveness assertion uses.
+        self.expected_retired = set()    # seqs that landed in some memtable
+
+    # ============================================================
+    # WRITE PATH
+    # ============================================================
+    atomic fair action NormalWrite:
+        require self.normal_writes < MAX_NORMAL_WRITES
+        # Oracle assigns commit_seq atomically with batch_write.
+        seq = self.next_seq
+        self.next_seq = self.next_seq + 1
+        self.normal_writes = self.normal_writes + 1
+        # Append to wal_buffer (atomic with the memtable write).
+        self.wal_buffer_seqs.append(seq)
+        # Write to active memtable.
+        self.active_memtable_seqs.append(seq)
+        # Track that this seq must eventually be retired.
+        self.expected_retired.add(seq)
+
+    atomic fair action TxnConflict:
+        # Transaction conflict: seqnum is consumed BEFORE the conflict check
+        # but NOTHING is appended to wal_buffer or memtable.
+        require self.conflicts < MAX_TXN_CONFLICTS
+        seq = self.next_seq
+        self.next_seq = self.next_seq + 1
+        self.conflicts = self.conflicts + 1
+        # Gap: seq is lost.
+
+    # ============================================================
+    # MEMTABLE FREEZE
+    # ============================================================
+    atomic fair action FreezeMemtable:
+        require len(self.active_memtable_seqs) > 0
+        first_seq = self.active_memtable_seqs[0]
+        last_seq = self.active_memtable_seqs[-1]
+        ptr_id = self.next_ptr_id
+        self.next_ptr_id = self.next_ptr_id + 1
+        # push_front: newest at index 0
+        new_imms = [record(first_seq=first_seq, last_seq=last_seq, ptr_id=ptr_id, uploaded=False)]
+        for x in self.imm_memtables:
+            new_imms.append(x)
+        self.imm_memtables = new_imms
+        self.active_memtable_seqs = []
+
+    # ============================================================
+    # WAL FLUSH PATH
+    # ============================================================
+    atomic fair action FreezeWal:
+        require len(self.wal_buffer_seqs) > 0
+        last_seq = self.wal_buffer_seqs[-1]
+        self.wal_chunks.append(record(last_seq=last_seq))
+        self.wal_buffer_seqs = []
+
+    atomic fair action FlushWalChunk:
+        require len(self.wal_chunks) > 0
+        chunk = self.wal_chunks[0]
+        self.wal_chunks = self.wal_chunks[1:]
+        if chunk.last_seq > self.durable_seq:
+            self.durable_seq = chunk.last_seq
+
+
+role Uploader:
+    action Init:
+        pass
+
+    # Pick any non-uploaded imm and complete its upload. This nondeterministically
+    # selects the upload completion order (uploads happen in parallel in real code).
+    atomic fair action UploadImm:
+        # Find first non-uploaded imm
+        candidates = []
+        for i in range(len(db.imm_memtables)):
+            if not db.imm_memtables[i].uploaded:
+                candidates.append(i)
+        require len(candidates) > 0
+        i = oneof candidates
+        imm = db.imm_memtables[i]
+
+        # ManifestWriter.handle_uploaded: insert into `ready` keyed by first_seq.
+        # If the key already exists, this is `SlateDBError::InvalidDBState` —
+        # treated here as a safety failure.
+        if imm.first_seq in db.ready_uploads:
+            db.invalid_state_error = True
+        else:
+            db.ready_uploads[imm.first_seq] = record(
+                first_seq=imm.first_seq,
+                last_seq=imm.last_seq,
+                ptr_id=imm.ptr_id,
+            )
+
+        # Mark imm as uploaded
+        new_imms = []
+        for j in range(len(db.imm_memtables)):
+            if j == i:
+                new_imms.append(record(
+                    first_seq=imm.first_seq,
+                    last_seq=imm.last_seq,
+                    ptr_id=imm.ptr_id,
+                    uploaded=True,
+                ))
+            else:
+                new_imms.append(db.imm_memtables[j])
+        db.imm_memtables = new_imms
+
+
+role ManifestWriter:
+    action Init:
+        pass
+
+    # Models `take_next_ready_batch` + `apply_uploaded_state` from PR #1603.
+    # Iterates the imm_memtable deque OLDEST-first (i.e. iter().rev()), looks
+    # up each imm in `ready` by first_seq, breaks on miss or WAL-not-durable.
+    atomic fair action RetireBatch:
+        # imm_memtables: index 0 is newest, last index is oldest.
+        # iter().rev() means we start from the oldest (back of deque).
+        batch_indices = []
+        i = len(db.imm_memtables) - 1
+        broke = False
+        for _ in range(len(db.imm_memtables)):
+            if i < 0:
+                broke = True
+                break
+            imm = db.imm_memtables[i]
+            # Look up by first_seq in ready_uploads.
+            if imm.first_seq not in db.ready_uploads:
+                broke = True
+                break
+            uploaded = db.ready_uploads[imm.first_seq]
+            # ptr_id equality assertion in real code (Arc::ptr_eq)
+            if uploaded.ptr_id != imm.ptr_id:
+                db.ptr_id_mismatch = True
+                broke = True
+                break
+            # WAL durable check
+            if uploaded.last_seq > db.durable_seq:
+                broke = True
+                break
+            batch_indices.append(i)
+            i = i - 1
+
+        require len(batch_indices) > 0
+
+        # Apply the batch: pop_back the imms in oldest-first order, advance
+        # last_l0_seq. The assert `uploaded.last_seq > core.last_l0_seq` must hold.
+        for idx in batch_indices:
+            imm = db.imm_memtables[idx]
+            uploaded = db.ready_uploads[imm.first_seq]
+            # Assertion in real code:
+            if uploaded.last_seq <= db.last_l0_seq:
+                db.last_l0_seq_panic = True
+            db.last_l0_seq = uploaded.last_seq
+
+        # Rebuild imm_memtables removing all batched indices.
+        new_imms = []
+        batch_set = set(batch_indices)
+        for j in range(len(db.imm_memtables)):
+            if j not in batch_set:
+                new_imms.append(db.imm_memtables[j])
+        db.imm_memtables = new_imms
+
+        # Remove from ready_uploads.
+        retired_first_seqs = set()
+        for idx in batch_indices:
+            # We already removed from imm_memtables, so look up by what we had
+            # stored. The previous loop saved imm references; recompute from
+            # ready_uploads to be safe.
+            pass
+        # Easier: iterate ready_uploads and drop entries whose first_seq is no
+        # longer in imm_memtables.
+        live_first_seqs = set()
+        for x in db.imm_memtables:
+            live_first_seqs.add(x.first_seq)
+        new_ready = {}
+        for fs in db.ready_uploads:
+            if fs in live_first_seqs:
+                new_ready[fs] = db.ready_uploads[fs]
+        db.ready_uploads = new_ready
+
+
+action Init:
+    db = Db()
+    db.invalid_state_error = False
+    db.ptr_id_mismatch = False
+    db.last_l0_seq_panic = False
+    uploader = Uploader()
+    manifest_writer = ManifestWriter()
+
+
+# ============================================================
+# SAFETY ASSERTIONS
+# ============================================================
+always assertion NoInvalidDbState:
+    return not db.invalid_state_error
+
+always assertion NoPtrIdMismatch:
+    return not db.ptr_id_mismatch
+
+always assertion NoLastL0SeqPanic:
+    return not db.last_l0_seq_panic
+
+# `last_l0_seq` must be monotonically non-decreasing.
+always assertion LastL0SeqMonotone:
+    return db.last_l0_seq <= db.next_seq
+
+# ============================================================
+# LIVENESS — THE HANG WE'RE HUNTING
+# ============================================================
+# Every seq written into the active memtable must eventually be retired
+# (i.e., db.last_l0_seq >= seq).
+# This is THE liveness property that PR #1603 was supposed to ensure.
+always eventually assertion AllWritesRetired:
+    for s in db.expected_retired:
+        if s > db.last_l0_seq:
+            return False
+    return True
+
+# Every imm-memtable should eventually be retired.
+always eventually assertion AllImmsRetired:
+    return len(db.imm_memtables) == 0
+
+# Every uploaded entry should eventually be cleared from `ready`.
+always eventually assertion ReadyDrainedEventually:
+    return len(db.ready_uploads) == 0

@@ -1,0 +1,226 @@
+---
+deadlock_detection: false
+options:
+    max_actions: 80
+    crash_on_yield: false
+action_options:
+    Db.NormalWrite:
+        max_actions: 3
+    Db.TxnConflict:
+        max_actions: 2
+    Db.WalAppendOnly:
+        max_actions: 1
+    Db.FreezeMemtable:
+        max_actions: 3
+    Db.FreezeWal:
+        max_actions: 4
+    Db.FlushWalChunk:
+        max_actions: 4
+    Uploader.UploadImm:
+        max_actions: 3
+    ManifestWriter.RetireBatch:
+        max_actions: 3
+---
+
+# Extended model: adds a `WalAppendOnly` action that simulates the case where
+# `wal_buffer.append` succeeded but `maybe_trigger_flush` failed AND the
+# write_batch returned early before writing the entry to the memtable. The
+# seqnum is consumed, the entry is in the WAL, but it's NOT in any memtable.
+#
+# Compare with TxnConflict where the seqnum is consumed but NOTHING is written
+# (neither WAL nor memtable).
+#
+# Looking for hangs introduced by these "phantom WAL entries" in interaction
+# with the post-fix retirement logic.
+
+MAX_NORMAL_WRITES = 2
+MAX_TXN_CONFLICTS = 2
+MAX_WAL_ONLY = 1
+
+role Db:
+    action Init:
+        self.next_seq = 1
+        self.durable_seq = 0
+        self.last_l0_seq = 0
+
+        self.active_memtable_seqs = []
+        self.imm_memtables = []
+        self.next_ptr_id = 1
+
+        self.wal_buffer_seqs = []
+        self.wal_chunks = []
+
+        self.ready_uploads = {}
+
+        self.normal_writes = 0
+        self.conflicts = 0
+        self.wal_only_count = 0
+
+        # Liveness sentinel: only `expected_retired` seqs must eventually
+        # reach `last_l0_seq` (txn-conflict and wal-only seqs are NOT in
+        # this set because nothing depends on the manifest knowing them).
+        self.expected_retired = set()
+
+    atomic fair action NormalWrite:
+        require self.normal_writes < MAX_NORMAL_WRITES
+        seq = self.next_seq
+        self.next_seq = self.next_seq + 1
+        self.normal_writes = self.normal_writes + 1
+        self.wal_buffer_seqs.append(seq)
+        self.active_memtable_seqs.append(seq)
+        self.expected_retired.add(seq)
+
+    atomic fair action TxnConflict:
+        require self.conflicts < MAX_TXN_CONFLICTS
+        seq = self.next_seq
+        self.next_seq = self.next_seq + 1
+        self.conflicts = self.conflicts + 1
+        # Nothing else.
+
+    atomic fair action WalAppendOnly:
+        # wal_buffer.append() succeeded but maybe_trigger_flush() failed.
+        # WAL has the entry; memtable does NOT.
+        require self.wal_only_count < MAX_WAL_ONLY
+        seq = self.next_seq
+        self.next_seq = self.next_seq + 1
+        self.wal_only_count = self.wal_only_count + 1
+        self.wal_buffer_seqs.append(seq)
+        # No active_memtable update; no expected_retired addition.
+
+    atomic fair action FreezeMemtable:
+        require len(self.active_memtable_seqs) > 0
+        first_seq = self.active_memtable_seqs[0]
+        last_seq = self.active_memtable_seqs[-1]
+        ptr_id = self.next_ptr_id
+        self.next_ptr_id = self.next_ptr_id + 1
+        new_imms = [record(first_seq=first_seq, last_seq=last_seq, ptr_id=ptr_id, uploaded=False)]
+        for x in self.imm_memtables:
+            new_imms.append(x)
+        self.imm_memtables = new_imms
+        self.active_memtable_seqs = []
+
+    atomic fair action FreezeWal:
+        require len(self.wal_buffer_seqs) > 0
+        last_seq = self.wal_buffer_seqs[-1]
+        self.wal_chunks.append(record(last_seq=last_seq))
+        self.wal_buffer_seqs = []
+
+    atomic fair action FlushWalChunk:
+        require len(self.wal_chunks) > 0
+        chunk = self.wal_chunks[0]
+        self.wal_chunks = self.wal_chunks[1:]
+        if chunk.last_seq > self.durable_seq:
+            self.durable_seq = chunk.last_seq
+
+
+role Uploader:
+    action Init:
+        pass
+
+    atomic fair action UploadImm:
+        candidates = []
+        for i in range(len(db.imm_memtables)):
+            if not db.imm_memtables[i].uploaded:
+                candidates.append(i)
+        require len(candidates) > 0
+        i = oneof candidates
+        imm = db.imm_memtables[i]
+        if imm.first_seq in db.ready_uploads:
+            db.invalid_state_error = True
+        else:
+            db.ready_uploads[imm.first_seq] = record(
+                first_seq=imm.first_seq,
+                last_seq=imm.last_seq,
+                ptr_id=imm.ptr_id,
+            )
+        new_imms = []
+        for j in range(len(db.imm_memtables)):
+            if j == i:
+                new_imms.append(record(
+                    first_seq=imm.first_seq,
+                    last_seq=imm.last_seq,
+                    ptr_id=imm.ptr_id,
+                    uploaded=True,
+                ))
+            else:
+                new_imms.append(db.imm_memtables[j])
+        db.imm_memtables = new_imms
+
+
+role ManifestWriter:
+    action Init:
+        pass
+
+    atomic fair action RetireBatch:
+        batch_indices = []
+        i = len(db.imm_memtables) - 1
+        for _ in range(len(db.imm_memtables)):
+            if i < 0:
+                break
+            imm = db.imm_memtables[i]
+            if imm.first_seq not in db.ready_uploads:
+                break
+            uploaded = db.ready_uploads[imm.first_seq]
+            if uploaded.ptr_id != imm.ptr_id:
+                db.ptr_id_mismatch = True
+                break
+            if uploaded.last_seq > db.durable_seq:
+                break
+            batch_indices.append(i)
+            i = i - 1
+
+        require len(batch_indices) > 0
+
+        for idx in batch_indices:
+            imm = db.imm_memtables[idx]
+            uploaded = db.ready_uploads[imm.first_seq]
+            if uploaded.last_seq <= db.last_l0_seq:
+                db.last_l0_seq_panic = True
+            db.last_l0_seq = uploaded.last_seq
+
+        batch_set = set(batch_indices)
+        new_imms = []
+        for j in range(len(db.imm_memtables)):
+            if j not in batch_set:
+                new_imms.append(db.imm_memtables[j])
+        db.imm_memtables = new_imms
+
+        live_first_seqs = set()
+        for x in db.imm_memtables:
+            live_first_seqs.add(x.first_seq)
+        new_ready = {}
+        for fs in db.ready_uploads:
+            if fs in live_first_seqs:
+                new_ready[fs] = db.ready_uploads[fs]
+        db.ready_uploads = new_ready
+
+
+action Init:
+    db = Db()
+    db.invalid_state_error = False
+    db.ptr_id_mismatch = False
+    db.last_l0_seq_panic = False
+    uploader = Uploader()
+    manifest_writer = ManifestWriter()
+
+
+always assertion NoInvalidDbState:
+    return not db.invalid_state_error
+
+always assertion NoPtrIdMismatch:
+    return not db.ptr_id_mismatch
+
+always assertion NoLastL0SeqPanic:
+    return not db.last_l0_seq_panic
+
+always eventually assertion AllWritesRetired:
+    for s in db.expected_retired:
+        if s > db.last_l0_seq:
+            return False
+    return True
+
+always eventually assertion AllImmsRetired:
+    return len(db.imm_memtables) == 0
+
+always eventually assertion ReadyDrainedEventually:
+    return len(db.ready_uploads) == 0
