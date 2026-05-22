@@ -32,6 +32,21 @@ action_options:
 #
 # Looking for hangs introduced by these "phantom WAL entries" in interaction
 # with the post-fix retirement logic.
+#
+# REALISM NOTE on WalAppendOnly:
+# In real code, `write_batch` ALWAYS appends to the WAL buffer before deciding
+# whether to write the entry to the memtable. The failure mode being modeled
+# (wal_buffer.append succeeded, maybe_trigger_flush failed, returned early) can
+# fire at any point — there is no requirement that the active memtable be
+# empty. So we deliberately do NOT add `require len(active_memtable_seqs) == 0`
+# here; doing so would under-approximate real interleavings.
+#
+# The reverse question — could a phantom WAL entry MASK a hang by advancing
+# durable_seq past an imm's last_seq that should have been stuck? — was checked
+# by tracing post-fix retirement: durable_seq advancing only enables more
+# retirement, and the post-fix retirement gates on `uploaded.last_seq <=
+# durable_seq` (not equality), so a higher durable_seq is monotonically safe.
+# WalAppendOnly therefore neither hides nor introduces a hang in this model.
 
 MAX_NORMAL_WRITES = 2
 MAX_TXN_CONFLICTS = 2

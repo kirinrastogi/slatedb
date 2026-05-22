@@ -25,6 +25,27 @@ action_options:
 # `next_seq`-driven contiguous loop that PR #1603 replaced. The bug: this loop
 # can never retire an imm whose `first_seq` is greater than `next_seq` after a
 # transaction conflict consumed the intermediate seq.
+#
+# CONFIRMED counterexample (fizz run 2026-05-21):
+#   NormalWrite        seq=1, memtable=[1], expected={1}
+#   NormalWrite        seq=2, memtable=[1,2], expected={1,2}
+#   TxnConflict        seq=3 consumed (gap)
+#   TxnConflict        seq=4 consumed (gap)
+#   FreezeMemtable     imm{first=1,last=2,ptr=1}
+#   NormalWrite        seq=5, memtable=[5], expected={1,2,5}
+#   FreezeMemtable     imms=[{5,5,ptr=2},{1,2,ptr=1}]
+#   FreezeWal+Flush    durable_seq=5
+#   UploadImm x2       ready_uploads={1:{1,2,1}, 5:{5,5,2}}
+#   RetireBatch        mw_next_seq walks 1->3, ready_uploads[3] missing -> STOPS
+#                      retires imm{1,2} only, last_l0_seq=2, mw_next_seq=3
+#   <stutter forever>  imm{5,5} stranded; AllWritesRetired liveness violated.
+#
+# This is exactly the #1593 hang. Counterexample artifact:
+# ~/src/github/slatedb/slatedb/specs/fizzbee/out/run_2026-05-21_16-57-15/error-graph.dot
+#
+# Rust regression test for the same scenario lives in
+# slatedb/src/db.rs::test_txn_conflict_commit_seq_gap_does_not_block_l0_retirement
+# (added in PR #1603).
 
 MAX_NORMAL_WRITES = 3
 MAX_TXN_CONFLICTS = 2
