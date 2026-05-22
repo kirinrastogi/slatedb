@@ -1,0 +1,437 @@
+---
+deadlock_detection: false
+options:
+    max_actions: 80
+    crash_on_yield: false
+action_options:
+    Db.NormalWrite:
+        max_actions: 3
+    Db.AdvanceCommittedSeq:
+        max_actions: 3
+    Db.TxnConflict:
+        max_actions: 1
+    Db.FreezeMemtable:
+        max_actions: 3
+    Db.FreezeWal:
+        max_actions: 3
+    Db.FlushWalChunk:
+        max_actions: 3
+    Db.Crash:
+        max_actions: 2
+    Db.Recover:
+        max_actions: 2
+    Uploader.UploadImm:
+        max_actions: 3
+    ManifestWriter.RetireBatch:
+        max_actions: 3
+---
+
+# # SlateDB Memtable Flusher with Oracle + Recovery
+#
+# Extends MemtableFlusher.fizz with:
+#  - the oracle's three sequence numbers, modeled separately:
+#      last_seq          (oracle.last_seq, assignment counter)
+#      last_committed_seq (oracle.last_committed_seq, reader visibility)
+#      last_durable_seq   (oracle.last_remote_persisted_seq, WAL durability)
+#  - per-seq durability tracking (durable_seqs grows on FlushWalChunk)
+#  - one Crash + Recover cycle that exercises WAL replay
+#
+# Modeled after the post-fix retirement logic (PR #1603).
+#
+# Bug-hunt targets:
+#  1. Oracle ordering: last_durable_seq <= last_committed_seq <= last_seq
+#     must hold always.
+#  2. Durability: every seq that was durable (in a flushed WAL chunk) before
+#     a crash must be findable after recovery — in active_memtable, an imm,
+#     or below last_l0_seq.
+#  3. Manifest monotonicity: last_l0_seq must not regress across crash.
+#  4. Recovery ordering: ImmMemtablesOrdered must still hold after Recover.
+#  5. Liveness: every durable seq is eventually retired.
+#
+# References:
+#  - slatedb/src/oracle.rs (the three seq counters and their advance methods)
+#  - slatedb/src/batch_write.rs (advance_committed_seq inside write_batch)
+#  - slatedb/src/wal_buffer.rs:366 (advance_durable_seq on WAL chunk flush)
+#  - slatedb/src/db.rs:628 (advance_durable_seq during replay)
+#  - slatedb/src/db_common.rs:79-83 (advance_last_seq/committed_seq during replay)
+
+MAX_NORMAL_WRITES = 3
+MAX_TXN_CONFLICTS = 1
+
+role Db:
+    action Init:
+        # Oracle state.
+        self.last_seq = 0
+        self.last_committed_seq = 0
+        self.last_durable_seq = 0
+        self.last_l0_seq = 0
+
+        # Volatile in-memory state.
+        self.active_memtable_seqs = []
+        self.imm_memtables = []
+        self.next_ptr_id = 1
+
+        self.wal_buffer_seqs = []
+        # Each chunk: {first_seq, last_seq, durable=Bool, seqs=list}.
+        self.wal_chunks = []
+
+        self.ready_uploads = {}
+
+        # Counters / sets used by invariants.
+        self.normal_writes = 0
+        self.conflicts = 0
+        self.durable_seqs = set()         # populated as WAL chunks flush
+        # Seqs that have been assigned & written to WAL+memtable but whose
+        # advance_committed_seq has not yet fired. Modeled separately to
+        # expose the race between write_batch's two-lock sequence and any
+        # concurrent freeze (db.flush, checkpoint).
+        self.pending_committed = []
+
+        # Crash machinery.
+        self.crashed = False
+        self.recovered = True
+        self.pre_crash_durable_seq = -1
+        self.pre_crash_l0_seq = -1
+
+    # ============================================================
+    # WRITE PATH
+    # ============================================================
+    # NormalWrite is the first half of batch_write::write_batch:
+    #   next_seq, wal_buffer.append, write_entries_to_memtable.
+    # advance_committed_seq is DEFERRED to AdvanceCommittedSeq, modeling the
+    # real-code window between releasing the memtable read-lock and acquiring
+    # the next read-lock in record_memtable_sequence. A concurrent freeze
+    # (db.flush, checkpoint) can slip into that window.
+    atomic fair action NormalWrite:
+        require not self.crashed
+        require self.normal_writes < MAX_NORMAL_WRITES
+        seq = self.last_seq + 1
+        self.last_seq = seq
+        self.normal_writes = self.normal_writes + 1
+        self.wal_buffer_seqs.append(seq)
+        self.active_memtable_seqs.append(seq)
+        self.pending_committed.append(seq)
+
+    atomic fair action AdvanceCommittedSeq:
+        require not self.crashed
+        require len(self.pending_committed) > 0
+        # The single-writer event loop processes pending commits in order.
+        seq = self.pending_committed[0]
+        self.pending_committed = self.pending_committed[1:]
+        # advance_committed_seq is a fetch_max in real code.
+        if seq > self.last_committed_seq:
+            self.last_committed_seq = seq
+
+    atomic fair action TxnConflict:
+        require not self.crashed
+        require self.conflicts < MAX_TXN_CONFLICTS
+        # next_seq() is consumed but the batch returns Err before any append
+        # and before advance_committed_seq.
+        self.last_seq = self.last_seq + 1
+        self.conflicts = self.conflicts + 1
+
+    atomic fair action FreezeMemtable:
+        require not self.crashed
+        require len(self.active_memtable_seqs) > 0
+        first_seq = self.active_memtable_seqs[0]
+        last_seq = self.active_memtable_seqs[-1]
+        ptr_id = self.next_ptr_id
+        self.next_ptr_id = self.next_ptr_id + 1
+        new_imms = [record(first_seq=first_seq, last_seq=last_seq, ptr_id=ptr_id, uploaded=False)]
+        for x in self.imm_memtables:
+            new_imms.append(x)
+        self.imm_memtables = new_imms
+        self.active_memtable_seqs = []
+
+    atomic fair action FreezeWal:
+        require not self.crashed
+        require len(self.wal_buffer_seqs) > 0
+        first_seq = self.wal_buffer_seqs[0]
+        last_seq = self.wal_buffer_seqs[-1]
+        seqs = []
+        for s in self.wal_buffer_seqs:
+            seqs.append(s)
+        self.wal_chunks.append(record(first_seq=first_seq, last_seq=last_seq, durable=False, seqs=seqs))
+        self.wal_buffer_seqs = []
+
+    # Flushes the oldest not-yet-durable chunk. wal_buffer.rs::do_flush iterates
+    # in order; we model the same.
+    atomic fair action FlushWalChunk:
+        require not self.crashed
+        target = -1
+        for j in range(len(self.wal_chunks)):
+            if not self.wal_chunks[j].durable:
+                target = j
+                break
+        require target >= 0
+        chunk = self.wal_chunks[target]
+        new_chunks = []
+        for j in range(len(self.wal_chunks)):
+            if j == target:
+                new_chunks.append(record(
+                    first_seq=chunk.first_seq,
+                    last_seq=chunk.last_seq,
+                    durable=True,
+                    seqs=chunk.seqs,
+                ))
+            else:
+                new_chunks.append(self.wal_chunks[j])
+        self.wal_chunks = new_chunks
+        # Mark each seq in the chunk as definitively durable.
+        for s in chunk.seqs:
+            self.durable_seqs.add(s)
+        if chunk.last_seq > self.last_durable_seq:
+            self.last_durable_seq = chunk.last_seq
+
+    # ============================================================
+    # CRASH + RECOVERY
+    # ============================================================
+    atomic fair action Crash:
+        require not self.crashed
+        self.crashed = True
+        self.recovered = False
+        self.pre_crash_durable_seq = self.last_durable_seq
+        self.pre_crash_l0_seq = self.last_l0_seq
+        # Volatile state is lost.
+        self.active_memtable_seqs = []
+        self.imm_memtables = []
+        self.wal_buffer_seqs = []
+        self.ready_uploads = {}
+        self.pending_committed = []
+        # Non-durable WAL chunks are lost; durable chunks survive on remote.
+        kept = []
+        for c in self.wal_chunks:
+            if c.durable:
+                kept.append(c)
+        self.wal_chunks = kept
+        # Oracle re-initializes from manifest's last_l0_seq for all three seqs.
+        # See db.rs:142 (DbOracle::new(last_l0_seq, last_l0_seq, last_l0_seq, ...)).
+        self.last_seq = self.last_l0_seq
+        self.last_committed_seq = self.last_l0_seq
+        self.last_durable_seq = self.last_l0_seq
+
+    atomic fair action Recover:
+        require self.crashed
+        require not self.recovered
+        # Replay durable WAL chunks in append order. Real code iterates
+        # WalReplayIterator in ascending WAL ID. Each replayed batch advances
+        # all three oracle seqs to its last_seq, and skips entries with
+        # seq <= last_l0_seq (already retired).
+        # See db.rs::replay_wal (628-631) and db_common.rs::replay_memtable
+        # (79-83).
+        max_seq = self.last_seq
+        rebuilt_active = []
+        for c in self.wal_chunks:
+            if c.durable:
+                # Skip already-retired prefix.
+                for s in c.seqs:
+                    if s > self.last_l0_seq:
+                        rebuilt_active.append(s)
+                        if s > max_seq:
+                            max_seq = s
+        self.active_memtable_seqs = rebuilt_active
+        self.last_seq = max_seq
+        self.last_committed_seq = max_seq
+        if max_seq > self.last_durable_seq:
+            self.last_durable_seq = max_seq
+        self.recovered = True
+        self.crashed = False
+
+
+role Uploader:
+    action Init:
+        pass
+
+    atomic fair action UploadImm:
+        require not db.crashed
+        candidates = []
+        for i in range(len(db.imm_memtables)):
+            if not db.imm_memtables[i].uploaded:
+                candidates.append(i)
+        require len(candidates) > 0
+        i = oneof candidates
+        imm = db.imm_memtables[i]
+        if imm.first_seq in db.ready_uploads:
+            db.invalid_state_error = True
+        else:
+            db.ready_uploads[imm.first_seq] = record(
+                first_seq=imm.first_seq,
+                last_seq=imm.last_seq,
+                ptr_id=imm.ptr_id,
+            )
+        new_imms = []
+        for j in range(len(db.imm_memtables)):
+            if j == i:
+                new_imms.append(record(
+                    first_seq=imm.first_seq,
+                    last_seq=imm.last_seq,
+                    ptr_id=imm.ptr_id,
+                    uploaded=True,
+                ))
+            else:
+                new_imms.append(db.imm_memtables[j])
+        db.imm_memtables = new_imms
+
+
+role ManifestWriter:
+    action Init:
+        pass
+
+    # Post-fix retirement: iterate imm_memtables oldest-first (reverse), look
+    # up by first_seq in ready_uploads, break on miss or WAL-not-durable.
+    atomic fair action RetireBatch:
+        require not db.crashed
+        batch_indices = []
+        i = len(db.imm_memtables) - 1
+        for _ in range(len(db.imm_memtables)):
+            if i < 0:
+                break
+            imm = db.imm_memtables[i]
+            if imm.first_seq not in db.ready_uploads:
+                break
+            uploaded = db.ready_uploads[imm.first_seq]
+            if uploaded.ptr_id != imm.ptr_id:
+                db.ptr_id_mismatch = True
+                break
+            if uploaded.last_seq > db.last_durable_seq:
+                break
+            batch_indices.append(i)
+            i = i - 1
+        require len(batch_indices) > 0
+
+        for idx in batch_indices:
+            imm = db.imm_memtables[idx]
+            uploaded = db.ready_uploads[imm.first_seq]
+            if uploaded.last_seq <= db.last_l0_seq:
+                db.last_l0_seq_panic = True
+            db.last_l0_seq = uploaded.last_seq
+
+        batch_set = set(batch_indices)
+        new_imms = []
+        for j in range(len(db.imm_memtables)):
+            if j not in batch_set:
+                new_imms.append(db.imm_memtables[j])
+        db.imm_memtables = new_imms
+
+        live_first_seqs = set()
+        for x in db.imm_memtables:
+            live_first_seqs.add(x.first_seq)
+        new_ready = {}
+        for fs in db.ready_uploads:
+            if fs in live_first_seqs:
+                new_ready[fs] = db.ready_uploads[fs]
+        db.ready_uploads = new_ready
+
+
+action Init:
+    db = Db()
+    db.invalid_state_error = False
+    db.ptr_id_mismatch = False
+    db.last_l0_seq_panic = False
+    db.last_l0_seq_regressed = False
+    uploader = Uploader()
+    manifest_writer = ManifestWriter()
+
+
+# ============================================================
+# SAFETY ASSERTIONS
+# ============================================================
+always assertion NoInvalidDbState:
+    return not db.invalid_state_error
+
+always assertion NoPtrIdMismatch:
+    return not db.ptr_id_mismatch
+
+always assertion NoLastL0SeqPanic:
+    return not db.last_l0_seq_panic
+
+# Oracle contract (the ACTUAL invariant — both `last_committed_seq` and
+# `last_durable_seq` are bounded by `last_seq`, but they are NOT ordered
+# with respect to each other).
+#
+# Finding: the tempting `last_durable_seq <= last_committed_seq` does NOT
+# hold. A NormalWrite appends to the WAL buffer (line 187 in
+# batch_write.rs) BEFORE advance_committed_seq fires (lines 212-218). The
+# WAL flush task can run in that window and bump last_durable_seq past
+# last_committed_seq. The reader code at reader.rs:117-125 handles this
+# safely via `.min(...)`, so it is NOT a correctness bug — but assuming
+# the ordering elsewhere would be wrong.
+always assertion SeqsBoundedByLastSeq:
+    if db.last_committed_seq > db.last_seq:
+        return False
+    if db.last_durable_seq > db.last_seq:
+        return False
+    return True
+
+always assertion LastL0SeqDurable:
+    return db.last_l0_seq <= db.last_durable_seq
+
+# Finding: `last_l0_seq <= last_committed_seq` does NOT hold either. The
+# full freeze -> upload -> retire pipeline can complete for an entry whose
+# write_batch hasn't yet reached advance_committed_seq, since a concurrent
+# `db.flush()` / checkpoint can freeze the memtable in the window between
+# write_entries_to_memtable (line 191 in batch_write.rs) and
+# track_recent_committed_* (lines 212-218). The post-fix retirement gate is
+# `uploaded.last_seq <= last_durable_seq`, NOT last_committed_seq.
+#
+# This is NOT a correctness bug: reader.rs:117-125 caps dirty=false readers
+# at min(last_remote_persisted_seq, last_committed_seq), so a reader at
+# last_committed_seq=K cannot observe entries with seq > K even if they
+# already sit in an L0 SST. Worth knowing if any future code tries to
+# assert the ordering, though.
+
+always assertion ImmMemtablesOrdered:
+    for i in range(len(db.imm_memtables) - 1):
+        if db.imm_memtables[i].first_seq <= db.imm_memtables[i + 1].first_seq:
+            return False
+    return True
+
+# After Recover, every seq that had been durable pre-crash must still be
+# findable: either retired (<= last_l0_seq), or sitting in active_memtable
+# or some imm. Non-durable writes may be lost — that's by design.
+always assertion NoDurableLoss:
+    if not db.recovered:
+        return True
+    if db.pre_crash_durable_seq < 0:
+        return True
+    for s in db.durable_seqs:
+        if s > db.pre_crash_durable_seq:
+            continue
+        found = s <= db.last_l0_seq
+        if not found:
+            for x in db.active_memtable_seqs:
+                if x == s:
+                    found = True
+        if not found:
+            for imm in db.imm_memtables:
+                if imm.first_seq <= s and s <= imm.last_seq:
+                    found = True
+        if not found:
+            return False
+    return True
+
+# last_l0_seq must not regress across crash/recover.
+always assertion LastL0SeqNoRegression:
+    if db.pre_crash_l0_seq < 0:
+        return True
+    return db.last_l0_seq >= db.pre_crash_l0_seq
+
+# ============================================================
+# LIVENESS
+# ============================================================
+# Every durable seq must eventually be retired (i.e., <= last_l0_seq) OR be
+# present in some imm waiting to be retired. We use the inclusive form.
+always eventually assertion AllDurableEventuallyRetiredOrPending:
+    for s in db.durable_seqs:
+        if s <= db.last_l0_seq:
+            continue
+        present = False
+        for imm in db.imm_memtables:
+            if imm.first_seq <= s and s <= imm.last_seq:
+                present = True
+        for x in db.active_memtable_seqs:
+            if x == s:
+                present = True
+        if not present:
+            return False
+    return True
