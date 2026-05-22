@@ -161,6 +161,9 @@ role ManifestWriter:
     atomic fair action RetireBatch:
         ns = db.mw_next_seq
         batch_first_seqs = []
+        # FizzBee requires a finite loop bound. The body terminates via `break`
+        # on the first key miss; the +1 is just to ensure the bound exceeds any
+        # possible number of iterations (one per entry in ready_uploads).
         for _ in range(len(db.ready_uploads) + 1):
             if ns not in db.ready_uploads:
                 break

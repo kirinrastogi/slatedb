@@ -240,15 +240,8 @@ role ManifestWriter:
                 new_imms.append(db.imm_memtables[j])
         db.imm_memtables = new_imms
 
-        # Remove from ready_uploads.
-        retired_first_seqs = set()
-        for idx in batch_indices:
-            # We already removed from imm_memtables, so look up by what we had
-            # stored. The previous loop saved imm references; recompute from
-            # ready_uploads to be safe.
-            pass
-        # Easier: iterate ready_uploads and drop entries whose first_seq is no
-        # longer in imm_memtables.
+        # Drop entries from ready_uploads whose first_seq is no longer in
+        # imm_memtables (i.e., the ones we just retired).
         live_first_seqs = set()
         for x in db.imm_memtables:
             live_first_seqs.add(x.first_seq)
