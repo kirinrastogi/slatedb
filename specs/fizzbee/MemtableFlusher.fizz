@@ -280,9 +280,24 @@ always assertion NoPtrIdMismatch:
 always assertion NoLastL0SeqPanic:
     return not db.last_l0_seq_panic
 
-# `last_l0_seq` must be monotonically non-decreasing.
-always assertion LastL0SeqMonotone:
+# `last_l0_seq` is bounded by the seq counter (a sanity bound, not monotonicity).
+always assertion LastL0SeqBounded:
     return db.last_l0_seq <= db.next_seq
+
+# Once retired to the manifest, the seq must already be WAL-durable.
+# Guarded inside RetireBatch (uploaded.last_seq <= durable_seq); asserted
+# globally so any future bypass surfaces immediately.
+always assertion LastL0SeqDurable:
+    return db.last_l0_seq <= db.durable_seq
+
+# imm_memtables is push_front-ordered: newer at index 0, older at the end.
+# Strictly decreasing first_seq is required for the reverse-iteration in
+# RetireBatch to be correct.
+always assertion ImmMemtablesOrdered:
+    for i in range(len(db.imm_memtables) - 1):
+        if db.imm_memtables[i].first_seq <= db.imm_memtables[i + 1].first_seq:
+            return False
+    return True
 
 # ============================================================
 # LIVENESS — THE HANG WE'RE HUNTING

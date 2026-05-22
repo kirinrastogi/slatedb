@@ -211,6 +211,15 @@ always assertion NoPtrIdMismatch:
 always assertion NoLastL0SeqPanic:
     return not db.last_l0_seq_panic
 
+always assertion LastL0SeqDurable:
+    return db.last_l0_seq <= db.durable_seq
+
+always assertion ImmMemtablesOrdered:
+    for i in range(len(db.imm_memtables) - 1):
+        if db.imm_memtables[i].first_seq <= db.imm_memtables[i + 1].first_seq:
+            return False
+    return True
+
 always eventually assertion AllWritesRetired:
     for s in db.expected_retired:
         if s > db.last_l0_seq:
